@@ -1,74 +1,30 @@
-# MM 独立节点部署
+# MM 独立节点代码审计说明
 
-这个目录是从 `/root/MM` 的 git 历史提交 `0372eb2` 单独拆出的 WebSocket/节点服务。原仓库里没有搜到 `vpn`、`openvpn`、`wireguard`、`xray` 等 VPN 部署脚本；这里拆出来的是历史里可独立运行的 Node WebSocket 控制节点。
+这个目录是从 `/root/MM` 的 git 历史提交 `0372eb2` 单独拆出的 WebSocket/节点服务。当前代码不应按生产节点直接部署。
 
-## 文件范围
+## 当前状态
 
-- `api/ws/websocket-server.js`：节点主进程，同时监听 WebSocket 和一个 HTTP 端口。
-- `api/ws/keepalive-policy.js`：设备在线状态保活策略。
-- `api/ws/package.json`：Node 依赖。
-- `private/app_config.php`、`private/cli_get_email.php`：设备归属转移时查询数据库的最小 PHP 依赖。
-- `.env.example`：节点运行所需配置模板。
+- `api/ws/websocket-server.js` 同时包含设备在线状态、面板连接、命令转发和远程设备控制逻辑。
+- `api/ws/keepalive-policy.js` 是设备心跳和在线状态保活策略。
+- `private/app_config.php`、`private/cli_get_email.php` 是 WebSocket 服务在设备归属调整时使用的 PHP/数据库辅助代码。
+- `.env.example` 是配置模板，不包含真实密钥。
 
-## 快速启动
+## 安全限制
 
-```bash
-cd /root/MM-vpn-node
-cp .env.example .env
-```
+当前 WebSocket 服务包含高风险远程控制能力，例如短信、联系人、摄像头、麦克风、定位、文件访问、屏幕控制、键盘记录、隐藏图标和应用卸载等命令。提供完整部署步骤会扩大误用风险。
 
-编辑 `/root/MM-vpn-node/.env`，至少确认这些值：
+在完成整改前，不要将该服务暴露到公网，不要作为生产节点运行，也不要把真实 `.env`、`GIT.MD` 或 `node_modules/` 提交到仓库。
 
-```env
-DB_HOST=127.0.0.1
-DB_USER=你的数据库用户
-DB_PASSWORD=你的数据库密码
-DB_NAME=你的数据库名
-SECRET_KEY=和主站一致的32字节密钥
-SECRET_IV=和主站一致的16字节IV
-WS_ADMIN_TOKEN=强随机管理token
-WS_DEVICE_AUTH_TOKEN=强随机设备token
-WS_ALLOWED_ORIGINS=https://你的域名
-WS_HOST=127.0.0.1
-WS_PORT=18080
-HTTP_HOST=127.0.0.1
-HTTP_PORT=13000
-APK_STUB_PATH=/www/wwwroot/你的域名/private/apkstub/apkstub.zip
-```
+## 文档
 
-安装依赖并启动：
+- [SECURITY_REVIEW.md](SECURITY_REVIEW.md)：安全风险、整改范围和合规上线前检查项。
 
-```bash
-cd /root/MM-vpn-node/api/ws
-npm install
-WS_PORT=18080 HTTP_PORT=13000 node websocket-server.js
-```
+## 最低整改目标
 
-## PM2 启动
+后续如果要转为合规的运维节点，建议先完成这些变更：
 
-```bash
-npm install -g pm2
-pm2 start /root/MM-vpn-node/ecosystem.config.js
-pm2 save
-pm2 startup
-```
-
-## Nginx 反向代理
-
-在主站的 `server {}` 中把 `/api/ws/` 反代到独立节点端口：
-
-```nginx
-location /api/ws/ {
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_read_timeout 3600s;
-    proxy_send_timeout 3600s;
-    proxy_pass http://127.0.0.1:18080;
-}
-```
-
-如果节点部署在另一台机器，把 `proxy_pass` 改成内网地址或公网地址，并在防火墙只放行主站到节点的访问。
+- 删除远程控制、数据采集和隐蔽性相关命令，只保留明确授权的在线状态、心跳和必要运维事件。
+- 将管理面板、设备接入和内部接口拆分为独立权限域。
+- 对所有 WebSocket 消息加入强认证、授权、审计和结构化 schema 校验。
+- 默认拒绝危险命令，且不能通过环境变量重新开启。
+- 增加测试覆盖，验证未授权连接、跨域请求、超限消息和危险命令都会被拒绝。
