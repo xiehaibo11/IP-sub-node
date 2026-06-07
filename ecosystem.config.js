@@ -1,8 +1,10 @@
+const path = require("path");
+
 module.exports = {
   apps: [
     {
-      name: "mm-vpn-node",
-      cwd: "/root/MM-vpn-node/api/ws",
+      name: "ip-sub-node-ws",
+      cwd: path.join(__dirname, "api/ws"),
       script: "websocket-server.js",
       env: {
         WS_HOST: "0.0.0.0",

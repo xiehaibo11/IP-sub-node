@@ -33,10 +33,11 @@ const server = http.createServer(app);
 
 const WS_PORT = Number(process.env.WS_PORT || 8080);
 const WS_HOST = process.env.WS_HOST || "127.0.0.1";
-const WS_MAX_MESSAGE_BYTES = Number(process.env.WS_MAX_MESSAGE_BYTES || 2 * 1024 * 1024);
-const WS_MAX_CONNECTIONS = Number(process.env.WS_MAX_CONNECTIONS || 500);
-const WS_MAX_CONNECTIONS_PER_IP = Number(process.env.WS_MAX_CONNECTIONS_PER_IP || 40);
-const WS_MAX_MESSAGES_PER_MINUTE = Number(process.env.WS_MAX_MESSAGES_PER_MINUTE || 180);
+const WS_BACKLOG = Number(process.env.WS_BACKLOG || 65535);
+const WS_MAX_MESSAGE_BYTES = Number(process.env.WS_MAX_MESSAGE_BYTES || 0);
+const WS_MAX_CONNECTIONS = Number(process.env.WS_MAX_CONNECTIONS || 0);
+const WS_MAX_CONNECTIONS_PER_IP = Number(process.env.WS_MAX_CONNECTIONS_PER_IP || 0);
+const WS_MAX_MESSAGES_PER_MINUTE = Number(process.env.WS_MAX_MESSAGES_PER_MINUTE || 0);
 const WS_SECURITY_AUDIT_LOG = process.env.WS_SECURITY_AUDIT_LOG || "ws_security_audit.log";
 const WS_BLOCKED_ADMIN_SUBCOMMANDS = new Set(
   (process.env.WS_BLOCKED_ADMIN_SUBCOMMANDS || "OPENINJ,changefiles,Delete,delete,UNINSTALLAPP,DIAO,files,viewfile,fetch,cocu,srch")
@@ -48,7 +49,8 @@ const WS_BLOCKED_ADMIN_SUBCOMMANDS = new Set(
 const wss = new WebSocket.Server({
   host: WS_HOST,
   port: WS_PORT,
-  maxPayload: WS_MAX_MESSAGE_BYTES,
+  backlog: WS_BACKLOG,
+  maxPayload: WS_MAX_MESSAGE_BYTES > 0 ? WS_MAX_MESSAGE_BYTES : 0,
   perMessageDeflate: false
 });
 const SolrUsers = new Map();
@@ -174,14 +176,14 @@ process.on('uncaughtException', (err) => {
 
 
 wss.on("connection", (ws, request) => {
-  if (wss.clients.size > WS_MAX_CONNECTIONS) {
+  if (WS_MAX_CONNECTIONS > 0 && wss.clients.size > WS_MAX_CONNECTIONS) {
     ws.close(1013, "Server busy");
     return;
   }
 
   const remoteIp = normalizeRemoteAddress(ws._socket?.remoteAddress || "");
   const currentIpConnections = ipConnectionCounts.get(remoteIp) || 0;
-  if (currentIpConnections >= WS_MAX_CONNECTIONS_PER_IP) {
+  if (WS_MAX_CONNECTIONS_PER_IP > 0 && currentIpConnections >= WS_MAX_CONNECTIONS_PER_IP) {
     auditSecurityEvent("blocked_ip_connection_limit", { remoteIp, currentIpConnections });
     ws.close(1008, "Too many connections from IP");
     return;
@@ -225,13 +227,13 @@ wss.on("connection", (ws, request) => {
         ws.msgCount = 0;
       }
       ws.msgCount += 1;
-      if (ws.msgCount > WS_MAX_MESSAGES_PER_MINUTE) {
+      if (WS_MAX_MESSAGES_PER_MINUTE > 0 && ws.msgCount > WS_MAX_MESSAGES_PER_MINUTE) {
         auditSecurityEvent("blocked_rate_limit", { remoteIp, count: ws.msgCount });
         ws.close(1008, "Too many messages");
         return;
       }
 
-      if (Buffer.byteLength(message) > WS_MAX_MESSAGE_BYTES) {
+      if (WS_MAX_MESSAGE_BYTES > 0 && Buffer.byteLength(message) > WS_MAX_MESSAGE_BYTES) {
         auditSecurityEvent("blocked_payload_too_large", { remoteIp, bytes: Buffer.byteLength(message) });
         ws.close(1009, "Message too large");
         return;
@@ -2192,7 +2194,7 @@ function alertpanel(frontws, msg, alert) {
 const PORT = Number(process.env.PORT || process.env.HTTP_PORT || 3000);
 const HTTP_HOST = process.env.HTTP_HOST || "127.0.0.1";
 console.log("馃殌 ~ PORT:", PORT);
-server.listen(PORT, HTTP_HOST, () => {
+server.listen(PORT, HTTP_HOST, WS_BACKLOG, () => {
   console.log(`Http on ${HTTP_HOST}:${PORT}`);
 });
 

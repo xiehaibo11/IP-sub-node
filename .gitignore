@@ -3,6 +3,7 @@
 !.env.example
 
 GIT.MD
+GIT.md
 .claude/
 
 node_modules/
@@ -12,5 +13,9 @@ api/ws/node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+database/*.dump.sql
+database/*.full.sql
+database/*.local.sql
 
 .DS_Store
