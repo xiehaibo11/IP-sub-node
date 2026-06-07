@@ -245,6 +245,18 @@ nginx -t
 systemctl reload nginx
 ```
 
+HTTPS 站点安全头必须包含 HSTS，避免用户先访问 HTTP 或浏览器历史缓存导致地址栏显示“不安全”：
+
+```nginx
+add_header Strict-Transport-Security "max-age=31536000" always;
+```
+
+确认：
+
+```sh
+curl -I https://DOMAIN/sub/client.yaml | rg -i 'strict-transport-security|http/'
+```
+
 ## 7. Xray 配置要点
 
 Xray 至少要有两个 inbound：
