@@ -496,6 +496,7 @@ WebSocket 443 正常时，nginx access log 能看到该 path 返回 `101`。
 | Hiddify 能导入但没有节点 | sing-box JSON 结构不兼容或输出被错误缓存 | `curl` 下载后用 `sing-box check` 校验 |
 | 订阅返回 404 | 数据库没有 enabled token 记录或 token 过期 | 查 `vpn_clients` 记录 |
 | 速度不稳定 | IPv6 黑洞、DNS 污染、UDP 不稳、链式代理 | 关闭 IPv6、fake-ip、443 fallback、关闭 WARP |
+| 浏览器打开订阅显示“不安全”，但证书有效 | 当前标签仍是 HTTP、浏览器缓存旧安全状态，或订阅文本里出现明文 HTTP 测速 URL 造成误判 | 访问完整 `https://` 地址、清站点数据，并确保订阅里的测速 URL 使用 HTTPS |
 
 ## 14. 不要再重复的旧路
 

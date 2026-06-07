@@ -260,7 +260,7 @@ try {
     if ($hy2) {
         echo "  - name: 'AUTO'\n";
         echo "    type: url-test\n";
-        echo "    url: 'http://cp.cloudflare.com/generate_204'\n";
+        echo "    url: 'https://cp.cloudflare.com/generate_204'\n";
         echo "    interval: 180\n";
         echo "    tolerance: 50\n";
         echo "    proxies:\n";

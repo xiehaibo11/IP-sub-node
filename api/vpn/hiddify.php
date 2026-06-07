@@ -178,7 +178,7 @@ try {
             'type' => 'urltest',
             'tag' => 'AUTO',
             'outbounds' => $autoChoices,
-            'url' => 'http://cp.cloudflare.com/generate_204',
+            'url' => 'https://cp.cloudflare.com/generate_204',
             'interval' => '3m',
             'tolerance' => 50
         ];
