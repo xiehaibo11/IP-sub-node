@@ -1,5 +1,7 @@
 # VPN 节点部署文档
 
+> 注意：本文是旧 WireGuard 单协议部署说明，不是当前生产环境的完整部署路线。当前线上使用 VLESS 443、VLESS 8443、Hysteria2，并按 Clash/Hiddify 分发不同订阅格式。新部署和排障请使用 [Production VPN Subscription Runbook](PRODUCTION_DEPLOYMENT_RUNBOOK.md)。
+
 本文档说明如何在一台 Linux 服务器上部署一个标准 WireGuard VPN 节点。流程只涉及 VPN 隧道、转发、防火墙和客户端配置。
 
 ## 适用范围
