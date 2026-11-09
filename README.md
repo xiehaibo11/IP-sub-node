@@ -31,11 +31,13 @@ Clash 全局模式的 `GLOBAL` 默认直接选择 `AUTO`，避免经过被手动
 ## 目录与部署
 
 - `api/vpn/`：统一格式路由、两种订阅输出及元数据接口；旧 WireGuard 下载接口固定返回 HTTP 410。
-- `private/`：环境配置与共享订阅认证。
+- `private/`：环境配置、订阅认证，以及两种格式共用的节点配置 `subscription_nodes.php`。
 - `database/`：表结构和初始化说明；生产记录不提交 Git。
 - `deploy/`、`docs/`：nginx 示例和部署说明。
 
 运行环境为 nginx、PHP-FPM、MySQL/MariaDB、Xray、sing-box，由 systemd 管理。发布到 `/var/www/IP-sub-node`，从 `.env.example` 配置数据库、认证哈希和节点凭据，并将 `.env` 权限设为 `600`。仅在新数据库导入 `database/schema.sql`；该文件会重建 `vpn_clients`，不得导入已有生产表。
+
+客户端配置项以官方文档为准：[Mihomo](https://wiki.metacubex.one/)、[sing-box](https://sing-box.sagernet.org/)。
 
 ## 检查
 

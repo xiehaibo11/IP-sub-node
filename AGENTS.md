@@ -15,7 +15,7 @@
 ## Coding Style & Naming Conventions
 
 - PHP uses 4-space indentation, small endpoint scripts, and shared configuration via `require_once __DIR__ . '/../../private/app_config.php';`.
-- `clash.php` and `hiddify.php` each implement client lookup and node settings; keep both subscription formats in sync when changing node options.
+- Node settings (reading `.env`, validation, IPv4 resolution) live once in `private/subscription_nodes.php`; `clash.php` and `hiddify.php` only render them, so both formats always carry the same nodes.
 - Keep environment variable names uppercase with underscores, matching `.env.example` and `private/app_config.php`.
 - Prefer prepared PDO statements for database access and explicit response helpers for HTTP status and content type.
 

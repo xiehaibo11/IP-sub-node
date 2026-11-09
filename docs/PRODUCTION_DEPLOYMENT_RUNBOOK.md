@@ -93,11 +93,11 @@ IPv6 下一跳应单独读取系统路由，不能把 IPv4 网关验证当成 IP
 
 ```sh
 cp .env.example .env
-sudo chown www-data:www-data .env
+sudo chown ip-sub-web:ip-sub-web .env
 chmod 600 .env
 ```
 
-将属主替换为实际 PHP-FPM pool 用户；`600` 文件必须可被该用户读取。只更改权限而保留 `root` 属主会让 PHP 无法加载认证哈希，订阅返回 503。
+属主是 PHP-FPM pool 用户（生产环境 `/etc/php-fpm.d/` 中为 `ip-sub-web`，socket `/run/php-fpm/ip-sub-node.sock`）；`600` 文件必须可被该用户读取。只更改权限而保留 `root` 属主会让 PHP 无法加载认证哈希，订阅返回 503。
 
 必须配置 `DB_HOST`、`DB_USER`、`DB_PASSWORD`、`DB_NAME`、`SUBSCRIPTION_TOKEN_SHA256`，以及 `SUBSCRIPTION_NODE_UUID/HOST/PORT/SNI/NAME`。要分发完整三节点集合，还需：
 
@@ -110,7 +110,7 @@ chmod 600 .env
 
 项目发布目录为 `/var/www/IP-sub-node`。仅在空数据库导入 `database/schema.sql`，它包含 `DROP TABLE`，不能用于更新已有生产数据库。通过私有管理渠道配置至少一条启用且未过期的 `vpn_clients` 记录，并满足当前表的非空约束。
 
-两个 renderer 与 info 都按 id 使用首条有效记录。数据库中的旧 WireGuard 字段和旧 token 字段为兼容结构；订阅访问授权由 `.env` 中的部署级哈希控制。生产行数据不得提交 Git。
+`vpn_clients` 的时间一律为 UTC：代码用 `UTC_TIMESTAMP()` 比较 `expires_at`，设置有效期也必须用 `UTC_TIMESTAMP()`，不能用 `NOW()`（服务器时区为纽约，`NOW()` 写入的有效期会提前 5 小时失效）。建议在 MariaDB 配置 `default-time-zone = '+00:00'`。两个 renderer 与 info 都按 id 使用首条有效记录；节点配置的读取、校验与 IPv4 解析统一在 `private/subscription_nodes.php`。数据库中的旧 WireGuard 字段和旧 token 字段为兼容结构；订阅访问授权由 `.env` 中的部署级哈希控制。生产行数据不得提交 Git。
 
 使用 `deploy/nginx-secure-example.conf` 配置实际域名、证书、PHP-FPM socket 和 WS path。务必部署 `private/subscription_auth.php`，并将 `HTTP_AUTHORIZATION` 转发给 PHP-FPM。仅开放所需端点，其余路径返回 404；`.env`、数据库文件和 private 目录不能通过站点访问。
 
@@ -120,14 +120,14 @@ Xray 提供 TLS 8443 与 loopback WS 10086 两个入站，UUID 与 `.env` 一致
 
 ```sh
 sudo nginx -t
-sudo xray run -test -c /usr/local/etc/xray/config.json
+sudo xray run -test -c /etc/xray/config.json
 sudo sing-box check -c /etc/sing-box/config.json
-systemctl is-active nginx xray sing-box php8.3-fpm mariadb
+systemctl is-active nginx xray sing-box php-fpm mariadb
 ip -4 route get 1.1.1.1
 ip -6 route
 ```
 
-其中路径、PHP 版本和数据库 unit 名需按服务器实际安装调整。只有 nginx 配置变化时执行 `sudo systemctl reload nginx`；核心配置变化时，在原生校验通过后重启相应 unit 并复查监听与连通性。
+以上是当前生产环境（AlmaLinux 9）的实际路径与 unit 名，以 `systemctl cat xray sing-box` 的 `ExecStart` 为准。只有 nginx 配置变化时执行 `sudo systemctl reload nginx`；核心配置变化时，在原生校验通过后重启相应 unit 并复查监听与连通性。
 
 默认策略选择 `AUTO`，不要把存在自动组等同于当前已使用它。Mihomo 的 `AUTO` 使用 `url-test`：每 30 秒检查一次，单次超时 3 秒、要求 HTTP 204，切换容差为 30 ms。手机端使用 30 秒 `urltest`、30 ms 容差，并保留已有连接。测速只比较探测目标的延迟；它不测下载带宽，也不保证每个目标都获得最低延迟。手动指定单个节点时，该连接不会自动改走其他节点。
 
