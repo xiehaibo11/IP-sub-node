@@ -1,244 +1,58 @@
-VPN 节点部署文档
+# VPN 节点订阅
 
-> 当前生产环境已经不是旧 WireGuard 单协议部署。新开发者请先阅读 [Production VPN Subscription Runbook](docs/PRODUCTION_DEPLOYMENT_RUNBOOK.md)，里面写明了当前 VLESS 443、VLESS 8443、Hysteria2、Clash/Hiddify 双订阅分发、nginx/Xray/sing-box 流量路径和排障顺序。
+本项目通过一个带认证的 HTTPS 订阅地址分发 Clash/Mihomo YAML 和 Hiddify/sing-box JSON，实际代理流量由 nginx、Xray 和 sing-box 承载。部署与排障见 [Production VPN Subscription Runbook](docs/PRODUCTION_DEPLOYMENT_RUNBOOK.md)。
 
-本文档说明如何在一台 Linux 服务器上部署一个标准 WireGuard VPN 节点。流程只涉及 VPN 隧道、转发、防火墙和客户端配置。
+## 统一订阅与认证
 
-适用范围
-系统：Ubuntu 22.04/24.04 或 Debian 12。
-节点角色：公网 VPN 服务端。
-协议：WireGuard UDP。
-服务端 VPN 网段：10.66.0.0/24。
-服务端 VPN 地址：10.66.0.1/24。
-默认监听端口：51820/udp。
-下面命令默认以 root 执行。非 root 用户请在命令前加 sudo。
+桌面和手机均导入 `https://DOMAIN/sub/<64位小写十六进制token>`。服务端根据客户端 User-Agent 和 Accept 返回对应格式；无法识别时默认返回 Clash YAML，也可用 `?format=clash` 或 `?format=singbox` 指定格式。生产配置启用两个可选协议后，同一个 token 在两种格式中都包含全部三个节点。
 
-1. 准备服务器
-确认服务器具备：
+`/sub`、`/sub/client.yaml`、`/sub/mobile.json` 和 `/api/vpn/info.php` 同样需要认证，可传 `Authorization: Bearer <token>` 或 `?token=<token>`。旧 `/sub/<token>/client.yaml`、`mobile.json` 只有 token 匹配时才可访问，不再是免认证别名。缺失或错误凭据返回 HTTP 401；未配置认证哈希返回 503。
 
-一个公网 IPv4 地址。
-云安全组已放行 51820/udp。
-系统防火墙已允许 51820/udp。
-内核支持 WireGuard。Ubuntu 22.04/24.04 和 Debian 12 默认支持。
-查看默认公网网卡名：
+Token 由 32 个随机字节编码为 64 位十六进制，HTTPS 保护传输，服务器 `.env` 仅保存其 `SUBSCRIPTION_TOKEN_SHA256`。它是持有者凭据，完整订阅地址应通过私密渠道交付，不应进入 Git、截图或原始请求日志。VPN 节点另外使用 UUID/密码认证。
 
-ip route show default
-输出示例：
+## 节点与出口
 
-default via 102.204.223.1 dev ens17 proto static
-这里的公网网卡名是 ens17。后续配置中的 ens17 需要替换成你的实际网卡名。
+| 节点 | 公网入口 | 服务 |
+| --- | --- | --- |
+| VLESS TCP TLS | `8443/tcp` | Xray |
+| VLESS WebSocket TLS | `443/tcp` | nginx → `127.0.0.1:10086` Xray |
+| Hysteria2 | `8443/udp` | sing-box |
 
-2. 安装 WireGuard
-apt update
-apt install -y wireguard iptables qrencode
-确认命令可用：
+WebSocket 与 Hysteria2 分别由 `MOBILE_WS_ENABLED`、`HYSTERIA2_ENABLED` 控制。订阅在服务器端解析节点 IPv4，保留 TLS SNI/WS Host，解析失败返回 503；DNS 使用经认证节点发送的 DoH，策略组不提供 `DIRECT`。双栈 TUN 与严格路由接管流量，VLESS 使用 XUDP 承载 UDP。
 
-wg --version
-3. 开启 IPv4 转发
-写入内核参数：
+默认选择 `AUTO`。桌面和手机每 30 秒自动测速，以 30 ms 容差减少频繁切换；桌面检查超时为 3 秒。测速反映该探测目标的延迟，不等同于下载带宽或所有网站的延迟。HY2 默认省略固定带宽声明，使用自适应 BBR；只有测得实际链路能力后，才同时设置两个正值带宽参数。
 
-cat >/etc/sysctl.d/99-wireguard.conf <<'EOF'
-net.ipv4.ip_forward=1
-EOF
-sysctl --system
-确认结果为 1：
+Clash 全局模式的 `GLOBAL` 默认直接选择 `AUTO`，避免经过被手动固定的 `PROXY` 节点而失去自动选择。客户端可能保存旧配置和手动选择；更新订阅后需确认实际 `AUTO` 为 30 秒 `url-test`，并将 `GLOBAL` 与 `PROXY` 均选为 `AUTO`。手动选择单个节点时，不具备自动故障切换。
 
-sysctl net.ipv4.ip_forward
-4. 生成服务端密钥
-install -d -m 700 /etc/wireguard
-cd /etc/wireguard
-wg genkey | tee server_private.key | wg pubkey > server_public.key
-chmod 600 server_private.key
-cat server_public.key
-记录输出的服务端公钥，客户端配置会用到。
+服务器出口和下一跳以 `ip -4 route get 1.1.1.1`、`ip -6 route` 为准，不同服务商可能使用公网网关、内网网关或 IPv6 隧道。HTTP token 在订阅服务验证，VPN 凭据在节点验证。客户端关闭 VPN 后仍需操作系统断网策略才能阻止直连；WebRTC 私网地址展示与真实公网出口泄露应分别验证。
 
-5. 创建服务端配置
-将下面配置写入 /etc/wireguard/wg0.conf，并替换：
+订阅请求共享受限的持久数据库连接，只读取生成配置所需字段，每次重新检查账号启用状态与有效期；访问时间至多每分钟更新一次。两种格式都启用双栈解析，DNS 经认证代理发送，不使用客户端直连 DNS 回退。订阅接口的每 IP 限流返回 HTTP 429，仅限制配置下载，不限制已经建立的 VPN 业务流量。
 
-SERVER_PRIVATE_KEY：cat /etc/wireguard/server_private.key 的结果。
-ens17：你的公网网卡名。
-[Interface]
-Address = 10.66.0.1/24
-ListenPort = 51820
-PrivateKey = SERVER_PRIVATE_KEY
+## 目录与部署
 
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.66.0.0/24 -o ens17 -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -s 10.66.0.0/24 -o ens17 -j MASQUERADE
-建议文件权限：
+- `api/vpn/`：统一格式路由、两种订阅输出及元数据接口；旧 WireGuard 下载接口固定返回 HTTP 410。
+- `private/`：环境配置与共享订阅认证。
+- `database/`：表结构和初始化说明；生产记录不提交 Git。
+- `deploy/`、`docs/`：nginx 示例和部署说明。
 
-chmod 600 /etc/wireguard/wg0.conf
-6. 启动 VPN 节点
-systemctl enable --now wg-quick@wg0
-systemctl status wg-quick@wg0 --no-pager
-wg show
-如果使用 ufw：
+运行环境为 nginx、PHP-FPM、MySQL/MariaDB、Xray、sing-box，由 systemd 管理。发布到 `/var/www/IP-sub-node`，从 `.env.example` 配置数据库、认证哈希和节点凭据，并将 `.env` 权限设为 `600`。仅在新数据库导入 `database/schema.sql`；该文件会重建 `vpn_clients`，不得导入已有生产表。
 
-ufw allow 51820/udp
-ufw reload
-如果使用云服务器控制台安全组，也需要在控制台放行 51820/udp。
+## 检查
 
-7. 添加客户端
-以下示例添加第一个客户端 client1，客户端地址为 10.66.0.2/32。
+```sh
+find api private -name '*.php' -print0 | xargs -0 -n1 php -l
+```
 
-生成客户端密钥：
+以下命令从终端静默读取 token，只显示 HTTP 状态，不输出节点凭据；关闭 shell 调试后执行：
 
-cd /etc/wireguard
-wg genkey | tee client1_private.key | wg pubkey > client1_public.key
-chmod 600 client1_private.key
-把客户端加入服务端配置：
+```sh
+set +x
+VPN_BASE_URL='https://DOMAIN'
+IFS= read -r -s SUBSCRIPTION_TOKEN
+printf 'header = "Authorization: Bearer %s"\n' "$SUBSCRIPTION_TOKEN" |
+    curl --config - --silent --show-error --fail -A 'mihomo' \
+        --output /dev/null --write-out 'HTTP %{http_code}\n' "$VPN_BASE_URL/sub"
+unset SUBSCRIPTION_TOKEN
+```
 
-cat >>/etc/wireguard/wg0.conf <<'EOF'
-
-[Peer]
-PublicKey = CLIENT1_PUBLIC_KEY
-AllowedIPs = 10.66.0.2/32
-EOF
-替换 CLIENT1_PUBLIC_KEY：
-
-CLIENT1_PUBLIC_KEY=$(cat /etc/wireguard/client1_public.key)
-sed -i "s|CLIENT1_PUBLIC_KEY|$CLIENT1_PUBLIC_KEY|" /etc/wireguard/wg0.conf
-systemctl restart wg-quick@wg0
-wg show
-8. 生成客户端配置
-创建 /etc/wireguard/client1.conf：
-
-SERVER_PUBLIC_KEY=$(cat /etc/wireguard/server_public.key)
-CLIENT1_PRIVATE_KEY=$(cat /etc/wireguard/client1_private.key)
-SERVER_PUBLIC_IP="你的服务器公网IP"
-
-cat >/etc/wireguard/client1.conf <<EOF
-[Interface]
-PrivateKey = ${CLIENT1_PRIVATE_KEY}
-Address = 10.66.0.2/32
-DNS = 1.1.1.1, 8.8.8.8
-
-[Peer]
-PublicKey = ${SERVER_PUBLIC_KEY}
-Endpoint = ${SERVER_PUBLIC_IP}:51820
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
-EOF
-chmod 600 /etc/wireguard/client1.conf
-说明：
-
-AllowedIPs = 0.0.0.0/0 表示客户端所有 IPv4 流量都走 VPN。
-如果只希望访问内网，不接管全部流量，可改成 AllowedIPs = 10.66.0.0/24 或你的内网网段。
-PersistentKeepalive = 25 适合客户端在 NAT 网络后面时保持连接。
-手机端可以用二维码导入：
-
-qrencode -t ansiutf8 </etc/wireguard/client1.conf
-电脑端可直接导入 client1.conf。
-
-9. 连通性测试
-客户端连接后，在服务器上查看握手：
-
-wg show
-客户端测试：
-
-ping 10.66.0.1
-curl ifconfig.me
-如果 curl ifconfig.me 返回服务器公网 IP，说明客户端公网出口已经经过 VPN 节点。
-
-10. 常用运维命令
-查看状态：
-
-systemctl status wg-quick@wg0 --no-pager
-wg show
-重启服务：
-
-systemctl restart wg-quick@wg0
-停止服务：
-
-systemctl stop wg-quick@wg0
-查看日志：
-
-journalctl -u wg-quick@wg0 -n 100 --no-pager
-开机自启：
-
-systemctl enable wg-quick@wg0
-11. 删除客户端
-编辑 /etc/wireguard/wg0.conf，删除对应客户端的 [Peer] 段，然后重启：
-
-systemctl restart wg-quick@wg0
-wg show
-也可以保留配置文件，只移除运行中的 peer：
-
-wg set wg0 peer CLIENT_PUBLIC_KEY remove
-但这种方式不会修改 /etc/wireguard/wg0.conf，服务重启后 peer 会再次生效。
-
-12. 多客户端规划
-每个客户端必须使用唯一的 VPN 地址：
-
-客户端	VPN 地址
-client1	10.66.0.2/32
-client2	10.66.0.3/32
-client3	10.66.0.4/32
-不要让两个客户端共用同一个私钥或同一个 AllowedIPs 地址。
-
-13. 安全建议
-不要把 /etc/wireguard/*.key 和客户端配置提交到 Git。
-服务端私钥只保存在服务器 /etc/wireguard/server_private.key。
-每个客户端单独生成密钥，人员离职或设备丢失时只删除对应 peer。
-只开放 51820/udp 和必要的 SSH 管理端口。
-SSH 建议关闭密码登录，只使用密钥登录。
-定期执行系统更新：
-apt update
-apt upgrade -y
-14. 故障排查
-客户端没有握手
-检查：
-
-wg show
-ss -lunp | grep 51820
-重点确认：
-
-云安全组是否放行 端口/udp。
-系统防火墙是否放行 端口/udp。
-客户端 Endpoint 是否是正确的公网 IP 或域名。
-客户端时间是否准确。
-能连上但不能访问公网
-检查 IPv4 转发：
-
-sysctl net.ipv4.ip_forward
-检查 NAT 规则：
-
-iptables -t nat -S | grep 10.66.0.0
-确认 PostUp/PostDown 里的公网网卡名正确。
-
-能访问公网但 DNS 不通
-把客户端配置中的 DNS 改为可用解析器：
-
-DNS = 1.1.1.1, 8.8.8.8
-重新导入或重启客户端连接。
-
-15. 备份和迁移
-备份服务端配置：
-
-tar czf wireguard-backup.tgz /etc/wireguard
-chmod 600 wireguard-backup.tgz
-迁移到新服务器后：
-
-tar xzf wireguard-backup.tgz -C /
-systemctl enable --now wg-quick@wg0
-如果新服务器公网 IP 变化，需要更新所有客户端配置中的 Endpoint。
-
-启用PM2管理进程
-
-订阅分发地址：
-
-桌面客户端 Clash/Mihomo，VLESS TCP TLS：
-
-https://bcbbs3.cn/sub/client.yaml
-
-手机端 Hiddify/sing-box，VLESS TCP TLS：
-
-https://bcbbs3.cn/sub/mobile.json
-
-说明：
-
-两个订阅地址固定走不同输出格式，不再依赖 User-Agent 自动判断。
-节点服务由 Xray 监听 `8443/tcp`，TLS 证书使用 `bcbbs3.cn`。
-如果需要按用户分发，把 64 位 token 放在路径中：
-
-https://bcbbs3.cn/sub/TOKEN/client.yaml
-https://bcbbs3.cn/sub/TOKEN/mobile.json
+部署验收还需验证错误 token 拒绝、两种客户端导入、逐节点 TCP/UDP、DNS、公网 IPv4/IPv6 出口及客户端实际运行配置。

@@ -1,5 +1,8 @@
 <?php
 require_once __DIR__ . '/../../private/app_config.php';
+require_once __DIR__ . '/../../private/subscription_auth.php';
+require_subscription_access();
+require_once __DIR__ . '/../../private/subscription_client.php';
 
 function respond_yaml_error($code, $message) {
     http_response_code($code);
@@ -25,18 +28,23 @@ function ipv4_csv_values($value) {
 }
 
 function endpoint_ipv4_or_host($host) {
+    static $resolvedHosts = [];
     $host = trim((string)$host);
     if ($host === '') {
-        return $host;
+        respond_yaml_error(503, 'subscription node address cannot be resolved');
     }
     if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
         return $host;
     }
+    if (isset($resolvedHosts[$host])) {
+        return $resolvedHosts[$host];
+    }
     $resolved = gethostbyname($host);
     if ($resolved !== $host && filter_var($resolved, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        $resolvedHosts[$host] = $resolved;
         return $resolved;
     }
-    return $host;
+    respond_yaml_error(503, 'subscription node address cannot be resolved');
 }
 
 function vless_config_value($key, $default = '') {
@@ -101,8 +109,8 @@ function hysteria2_node_config($fallbackHost, $fallbackSni) {
         'sni' => vless_config_value('HYSTERIA2_SNI', $fallbackSni),
         'password' => $password,
         'obfs_password' => $obfsPassword,
-        'up_mbps' => vless_config_value('HYSTERIA2_UP_MBPS', vless_config_value('HYSTERIA2_UP_Mbps', '100')),
-        'down_mbps' => vless_config_value('HYSTERIA2_DOWN_MBPS', vless_config_value('HYSTERIA2_DOWN_Mbps', '500')),
+        'up_mbps' => vless_config_value('HYSTERIA2_UP_MBPS', vless_config_value('HYSTERIA2_UP_Mbps', '0')),
+        'down_mbps' => vless_config_value('HYSTERIA2_DOWN_MBPS', vless_config_value('HYSTERIA2_DOWN_Mbps', '0')),
     ];
 }
 
@@ -131,34 +139,21 @@ function mobile_ws_node_config($uuid, $fallbackHost, $fallbackSni) {
     ];
 }
 
-$token = trim($_GET['token'] ?? '');
-if ($token === '' || !preg_match('/^[a-f0-9]{64}$/', $token)) {
-    respond_yaml_error(400, 'invalid token');
-}
-
 try {
-    $pdo = new PDO(
-        'mysql:host=' . DB_ServerName . ';dbname=' . DB_Name . ';charset=utf8mb4',
-        DB_UserName,
-        DB_Password,
-        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
-    );
-    $stmt = $pdo->prepare("SELECT * FROM vpn_clients WHERE token = :token AND enabled = 1 AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) LIMIT 1");
-    $stmt->execute([':token' => $token]);
-    $client = $stmt->fetch(PDO::FETCH_ASSOC);
+    $client = subscription_client();
     if (!$client) {
         respond_yaml_error(404, 'subscription not found');
     }
-    $pdo->prepare("UPDATE vpn_clients SET last_config_viewed_at = UTC_TIMESTAMP() WHERE id = :id")->execute([':id' => $client['id']]);
 
-    $dns = array_filter(array_map('trim', explode(',', (string)$client['dns'])));
-    if (!$dns) $dns = ['1.1.1.1', '8.8.8.8'];
     $node = vless_node_config($client);
     $nodeName = $node['name'];
     $hy2 = hysteria2_node_config($node['host'], $node['sni']);
     $hy2Name = $hy2 ? $hy2['name'] : null;
     $mobileWs = mobile_ws_node_config($node['uuid'], $node['host'], $node['sni']);
     $mobileWsName = $mobileWs ? $mobileWs['name'] : null;
+    $nodeAddress = endpoint_ipv4_or_host($node['host']);
+    $hy2Address = $hy2 ? endpoint_ipv4_or_host($hy2['host']) : null;
+    $mobileWsAddress = $mobileWs ? endpoint_ipv4_or_host($mobileWs['host']) : null;
 
     header('Content-Type: text/plain; charset=utf-8');
     header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
@@ -166,21 +161,36 @@ try {
 
     echo "mixed-port: 7890\n";
     echo "allow-lan: false\n";
+    echo "bind-address: 127.0.0.1\n";
     echo "mode: rule\n";
-    echo "log-level: info\n";
-    echo "ipv6: false\n";
+    echo "log-level: warning\n";
+    echo "ipv6: true\n";
     echo "unified-delay: true\n";
     echo "tcp-concurrent: true\n";
     echo "keep-alive-idle: 120\n";
     echo "keep-alive-interval: 30\n";
     echo "profile:\n";
-    echo "  store-selected: true\n";
+    echo "  store-selected: false\n";
     echo "  store-fake-ip: true\n";
+    echo "tun:\n";
+    echo "  enable: true\n";
+    echo "  stack: gvisor\n";
+    echo "  auto-route: true\n";
+    echo "  strict-route: true\n";
+    echo "  auto-detect-interface: true\n";
+    echo "  inet6-address:\n";
+    echo "    - 'fdfe:dcba:9876::1/126'\n";
+    echo "  dns-hijack:\n";
+    echo "    - 'any:53'\n";
+    echo "    - 'tcp://any:53'\n";
     echo "dns:\n";
     echo "  enable: true\n";
-    echo "  ipv6: false\n";
+    echo "  ipv6: true\n";
+    echo "  cache-algorithm: arc\n";
+    echo "  prefer-h3: false\n";
     echo "  enhanced-mode: fake-ip\n";
     echo "  fake-ip-range: 198.18.0.1/16\n";
+    echo "  fake-ip-range6: '2001:2::/64'\n";
     echo "  fake-ip-filter:\n";
     echo "    - '*.lan'\n";
     echo "    - '*.local'\n";
@@ -196,26 +206,22 @@ try {
     echo "    - 'connect.rom.miui.com'\n";
     echo "    - 'detectportal.firefox.com'\n";
     echo "  default-nameserver:\n";
-    echo "    - '223.5.5.5'\n";
-    echo "    - '119.29.29.29'\n";
+    echo "    - 'https://1.1.1.1/dns-query#PROXY'\n";
+    echo "  respect-rules: true\n";
+    echo "  proxy-server-nameserver:\n";
+    echo "    - 'https://1.1.1.1/dns-query#PROXY'\n";
     echo "  nameserver:\n";
-    echo "    - 'https://dns.alidns.com/dns-query'\n";
-    echo "    - 'https://doh.pub/dns-query'\n";
-    echo "  fallback:\n";
-    foreach ($dns as $server) {
-        echo "    - '" . yaml_quote($server) . "'\n";
-    }
-    echo "  fallback-filter:\n";
-    echo "    geoip: true\n";
-    echo "    geoip-code: CN\n";
+    echo "    - 'https://1.1.1.1/dns-query#PROXY'\n";
+    echo "    - 'https://8.8.8.8/dns-query#PROXY'\n";
     echo "proxies:\n";
     echo "  - name: '" . yaml_quote($nodeName) . "'\n";
     echo "    type: vless\n";
-    echo "    server: '" . yaml_quote($node['host']) . "'\n";
+    echo "    server: '" . yaml_quote($nodeAddress) . "'\n";
     echo "    port: " . (int)$node['port'] . "\n";
     echo "    uuid: '" . yaml_quote($node['uuid']) . "'\n";
     echo "    encryption: none\n";
     echo "    udp: true\n";
+    echo "    packet-encoding: xudp\n";
     echo "    tls: true\n";
     echo "    servername: '" . yaml_quote($node['sni']) . "'\n";
     echo "    network: tcp\n";
@@ -223,13 +229,14 @@ try {
     echo "    tfo: true\n";
     echo "    client-fingerprint: chrome\n";
     if ($mobileWs) {
-        echo "  - name: '" . yaml_quote($mobileWsName) . "'\n";
+        echo "  - name: '" . yaml_quote($mobileWs['name']) . "'\n";
         echo "    type: vless\n";
-        echo "    server: '" . yaml_quote($mobileWs['host']) . "'\n";
+        echo "    server: '" . yaml_quote($mobileWsAddress) . "'\n";
         echo "    port: " . (int)$mobileWs['port'] . "\n";
         echo "    uuid: '" . yaml_quote($mobileWs['uuid']) . "'\n";
         echo "    encryption: none\n";
         echo "    udp: true\n";
+        echo "    packet-encoding: xudp\n";
         echo "    tls: true\n";
         echo "    servername: '" . yaml_quote($mobileWs['sni']) . "'\n";
         echo "    network: ws\n";
@@ -244,11 +251,13 @@ try {
     if ($hy2) {
         echo "  - name: '" . yaml_quote($hy2Name) . "'\n";
         echo "    type: hysteria2\n";
-        echo "    server: '" . yaml_quote($hy2['host']) . "'\n";
+        echo "    server: '" . yaml_quote($hy2Address) . "'\n";
         echo "    port: " . (int)$hy2['port'] . "\n";
         echo "    password: '" . yaml_quote($hy2['password']) . "'\n";
-        echo "    up: '" . yaml_quote($hy2['up_mbps'] . ' Mbps') . "'\n";
-        echo "    down: '" . yaml_quote($hy2['down_mbps'] . ' Mbps') . "'\n";
+        if ((float)$hy2['up_mbps'] > 0 && (float)$hy2['down_mbps'] > 0) {
+            echo "    up: '" . yaml_quote($hy2['up_mbps'] . ' Mbps') . "'\n";
+            echo "    down: '" . yaml_quote($hy2['down_mbps'] . ' Mbps') . "'\n";
+        }
         echo "    obfs: salamander\n";
         echo "    obfs-password: '" . yaml_quote($hy2['obfs_password']) . "'\n";
         echo "    sni: '" . yaml_quote($hy2['sni']) . "'\n";
@@ -256,54 +265,44 @@ try {
         echo "    alpn:\n";
         echo "      - h3\n";
     }
-    echo "proxy-groups:\n";
+    $proxyOrder = [$nodeName];
     if ($hy2) {
-        echo "  - name: 'AUTO'\n";
-        echo "    type: url-test\n";
-        echo "    url: 'https://cp.cloudflare.com/generate_204'\n";
-        echo "    interval: 180\n";
-        echo "    tolerance: 50\n";
-        echo "    proxies:\n";
-        if ($mobileWs) {
-            echo "      - '" . yaml_quote($mobileWsName) . "'\n";
-        }
-        echo "      - '" . yaml_quote($hy2Name) . "'\n";
-        echo "      - '" . yaml_quote($nodeName) . "'\n";
+        array_unshift($proxyOrder, $hy2Name);
+    }
+    if ($mobileWs) {
+        $proxyOrder[] = $mobileWsName;
+    }
+    echo "proxy-groups:\n";
+    echo "  - name: 'AUTO'\n";
+    echo "    type: url-test\n";
+    echo "    url: 'https://www.gstatic.com/generate_204'\n";
+    echo "    interval: 30\n";
+    echo "    timeout: 3000\n";
+    echo "    tolerance: 30\n";
+    echo "    expected-status: 204\n";
+    echo "    max-failed-times: 2\n";
+    echo "    lazy: false\n";
+    echo "    proxies:\n";
+    foreach ($proxyOrder as $proxyName) {
+        echo "      - '" . yaml_quote($proxyName) . "'\n";
     }
     echo "  - name: 'PROXY'\n";
     echo "    type: select\n";
     echo "    proxies:\n";
-    if ($mobileWs) {
-        echo "      - '" . yaml_quote($mobileWsName) . "'\n";
+    echo "      - AUTO\n";
+    foreach ($proxyOrder as $proxyName) {
+        echo "      - '" . yaml_quote($proxyName) . "'\n";
     }
-    if ($hy2) {
-        echo "      - AUTO\n";
-        echo "      - '" . yaml_quote($hy2Name) . "'\n";
-    }
-    echo "      - '" . yaml_quote($nodeName) . "'\n";
-    echo "      - DIRECT\n";
     echo "  - name: 'GLOBAL'\n";
     echo "    type: select\n";
     echo "    proxies:\n";
+    // Global mode must reach health-checked failover even when PROXY is pinned manually.
+    echo "      - AUTO\n";
     echo "      - PROXY\n";
-    if ($mobileWs) {
-        echo "      - '" . yaml_quote($mobileWsName) . "'\n";
+    foreach ($proxyOrder as $proxyName) {
+        echo "      - '" . yaml_quote($proxyName) . "'\n";
     }
-    if ($hy2) {
-        echo "      - AUTO\n";
-        echo "      - '" . yaml_quote($hy2Name) . "'\n";
-    }
-    echo "      - '" . yaml_quote($nodeName) . "'\n";
-    echo "      - DIRECT\n";
     echo "rules:\n";
-    echo "  - DOMAIN-SUFFIX,local,DIRECT\n";
-    echo "  - DOMAIN-SUFFIX,localhost,DIRECT\n";
-    echo "  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve\n";
-    echo "  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve\n";
-    echo "  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve\n";
-    echo "  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve\n";
-    echo "  - IP-CIDR,169.254.0.0/16,DIRECT,no-resolve\n";
-    echo "  - IP-CIDR,224.0.0.0/4,DIRECT,no-resolve\n";
     echo "  - MATCH,PROXY\n";
 } catch (Throwable $e) {
     error_log('[vpn-clash] ' . $e->getMessage());

@@ -1,5 +1,8 @@
 <?php
 require_once __DIR__ . '/../../private/app_config.php';
+require_once __DIR__ . '/../../private/subscription_auth.php';
+require_subscription_access();
+require_once __DIR__ . '/../../private/subscription_client.php';
 
 function respond_json_error($code, $message) {
     http_response_code($code);
@@ -25,6 +28,30 @@ function vless_required($key) {
     return $value;
 }
 
+function endpoint_ipv4_or_error($host) {
+    static $resolvedHosts = [];
+
+    $host = trim((string)$host);
+    if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        return $host;
+    }
+    if (isset($resolvedHosts[$host])) {
+        return $resolvedHosts[$host];
+    }
+    if ($host === '' || filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+        respond_json_error(503, 'subscription node requires an IPv4 endpoint');
+    }
+
+    $addresses = @gethostbynamel($host);
+    foreach ($addresses ?: [] as $address) {
+        if (filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            $resolvedHosts[$host] = $address;
+            return $address;
+        }
+    }
+    respond_json_error(503, 'subscription node IPv4 resolution failed');
+}
+
 function vless_node_config($client) {
     $uuid = vless_required('SUBSCRIPTION_NODE_UUID');
     if (!preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i', $uuid)) {
@@ -42,6 +69,7 @@ function vless_node_config($client) {
         'name' => vless_config_value('SUBSCRIPTION_NODE_NAME', $fallbackName),
         'uuid' => $uuid,
         'host' => $host,
+        'address' => endpoint_ipv4_or_error($host),
         'port' => $port,
         'sni' => vless_config_value('SUBSCRIPTION_NODE_SNI', $host),
     ];
@@ -68,15 +96,17 @@ function hysteria2_node_config($fallbackHost, $fallbackSni) {
         respond_json_error(503, 'invalid hysteria2 node port');
     }
 
+    $host = vless_config_value('HYSTERIA2_HOST', $fallbackHost);
     return [
         'name' => vless_config_value('HYSTERIA2_NAME', '🇺🇸 美国-HY2'),
-        'host' => vless_config_value('HYSTERIA2_HOST', $fallbackHost),
+        'host' => $host,
+        'address' => endpoint_ipv4_or_error($host),
         'port' => $port,
         'sni' => vless_config_value('HYSTERIA2_SNI', $fallbackSni),
         'password' => $password,
         'obfs_password' => $obfsPassword,
-        'up_mbps' => (int)vless_config_value('HYSTERIA2_UP_MBPS', vless_config_value('HYSTERIA2_UP_Mbps', '100')),
-        'down_mbps' => (int)vless_config_value('HYSTERIA2_DOWN_MBPS', vless_config_value('HYSTERIA2_DOWN_Mbps', '500')),
+        'up_mbps' => (int)vless_config_value('HYSTERIA2_UP_MBPS', vless_config_value('HYSTERIA2_UP_Mbps', '0')),
+        'down_mbps' => (int)vless_config_value('HYSTERIA2_DOWN_MBPS', vless_config_value('HYSTERIA2_DOWN_Mbps', '0')),
     ];
 }
 
@@ -95,35 +125,23 @@ function mobile_ws_node_config($uuid, $fallbackHost, $fallbackSni) {
         respond_json_error(503, 'invalid mobile websocket path');
     }
 
+    $host = vless_config_value('MOBILE_WS_HOST', $fallbackHost);
     return [
         'name' => vless_config_value('MOBILE_WS_NAME', '🇺🇸 美国-443'),
         'uuid' => $uuid,
-        'host' => vless_config_value('MOBILE_WS_HOST', $fallbackHost),
+        'host' => $host,
+        'address' => endpoint_ipv4_or_error($host),
         'port' => $port,
         'sni' => vless_config_value('MOBILE_WS_SNI', $fallbackSni),
         'path' => $path,
     ];
 }
 
-$token = trim($_GET['token'] ?? '');
-if ($token === '' || !preg_match('/^[a-f0-9]{64}$/', $token)) {
-    respond_json_error(400, 'invalid token');
-}
-
 try {
-    $pdo = new PDO(
-        'mysql:host=' . DB_ServerName . ';dbname=' . DB_Name . ';charset=utf8mb4',
-        DB_UserName,
-        DB_Password,
-        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
-    );
-    $stmt = $pdo->prepare("SELECT * FROM vpn_clients WHERE token = :token AND enabled = 1 AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()) LIMIT 1");
-    $stmt->execute([':token' => $token]);
-    $client = $stmt->fetch(PDO::FETCH_ASSOC);
+    $client = subscription_client();
     if (!$client) {
         respond_json_error(404, 'subscription not found');
     }
-    $pdo->prepare("UPDATE vpn_clients SET last_config_viewed_at = UTC_TIMESTAMP() WHERE id = :id")->execute([':id' => $client['id']]);
 
     $node = vless_node_config($client);
     $tag = $node['name'];
@@ -135,10 +153,9 @@ try {
     $vlessOutbound = [
         'type' => 'vless',
         'tag' => $tag,
-        'server' => $node['host'],
+        'server' => $node['address'],
         'server_port' => (int)$node['port'],
         'uuid' => $node['uuid'],
-        'network' => 'tcp',
         'packet_encoding' => 'xudp',
         'connect_timeout' => '5s',
         'tcp_fast_open' => true,
@@ -152,43 +169,34 @@ try {
         ]
     ];
 
-    $outbounds = [];
-    $finalOutbound = $tag;
-    if ($mobileWs || $hy2) {
-        $finalOutbound = 'PROXY';
-        $proxyChoices = [];
-        if ($mobileWs) $proxyChoices[] = $mobileWsTag;
-        if ($hy2) $proxyChoices[] = 'AUTO';
-        if ($hy2) $proxyChoices[] = $hy2Tag;
-        $proxyChoices[] = $tag;
-        $proxyChoices[] = 'DIRECT';
-        $outbounds[] = [
+    $finalOutbound = 'PROXY';
+    $autoChoices = [];
+    if ($hy2) $autoChoices[] = $hy2Tag;
+    $autoChoices[] = $tag;
+    if ($mobileWs) $autoChoices[] = $mobileWsTag;
+    $outbounds = [
+        [
             'type' => 'selector',
             'tag' => 'PROXY',
-            'outbounds' => $proxyChoices,
-            'default' => $mobileWs ? $mobileWsTag : 'AUTO'
-        ];
-    }
-    if ($hy2) {
-        $autoChoices = [];
-        if ($mobileWs) $autoChoices[] = $mobileWsTag;
-        $autoChoices[] = $hy2Tag;
-        $autoChoices[] = $tag;
-        $outbounds[] = [
+            'outbounds' => array_merge(['AUTO'], $autoChoices),
+            'default' => 'AUTO'
+        ],
+        [
             'type' => 'urltest',
             'tag' => 'AUTO',
             'outbounds' => $autoChoices,
-            'url' => 'https://cp.cloudflare.com/generate_204',
-            'interval' => '3m',
-            'tolerance' => 50
-        ];
-        $outbounds[] = [
+            'url' => 'https://www.gstatic.com/generate_204',
+            'interval' => '30s',
+            'tolerance' => 30,
+            'interrupt_exist_connections' => false
+        ]
+    ];
+    if ($hy2) {
+        $hy2Outbound = [
             'type' => 'hysteria2',
             'tag' => $hy2Tag,
-            'server' => $hy2['host'],
+            'server' => $hy2['address'],
             'server_port' => (int)$hy2['port'],
-            'up_mbps' => $hy2['up_mbps'],
-            'down_mbps' => $hy2['down_mbps'],
             'password' => $hy2['password'],
             'obfs' => [
                 'type' => 'salamander',
@@ -200,15 +208,19 @@ try {
                 'alpn' => ['h3']
             ]
         ];
+        if ($hy2['up_mbps'] > 0 && $hy2['down_mbps'] > 0) {
+            $hy2Outbound['up_mbps'] = $hy2['up_mbps'];
+            $hy2Outbound['down_mbps'] = $hy2['down_mbps'];
+        }
+        $outbounds[] = $hy2Outbound;
     }
     if ($mobileWs) {
         $outbounds[] = [
             'type' => 'vless',
-            'tag' => $mobileWsTag,
-            'server' => $mobileWs['host'],
+            'tag' => $mobileWs['name'],
+            'server' => $mobileWs['address'],
             'server_port' => (int)$mobileWs['port'],
             'uuid' => $mobileWs['uuid'],
-            'network' => 'tcp',
             'packet_encoding' => 'xudp',
             'connect_timeout' => '5s',
             'tcp_fast_open' => true,
@@ -230,14 +242,6 @@ try {
         ];
     }
     $outbounds[] = $vlessOutbound;
-    $outbounds[] = [
-        'type' => 'direct',
-        'tag' => 'DIRECT'
-    ];
-    $outbounds[] = [
-        'type' => 'block',
-        'tag' => 'REJECT'
-    ];
 
     $config = [
         'log' => [
@@ -248,23 +252,33 @@ try {
             'servers' => [
                 [
                     'tag' => 'cloudflare',
-                    'type' => 'udp',
-                    'server' => '1.1.1.1'
+                    'type' => 'https',
+                    'server' => '1.1.1.1',
+                    'detour' => $finalOutbound,
+                    'tls' => [
+                        'enabled' => true,
+                        'server_name' => 'cloudflare-dns.com'
+                    ]
                 ],
                 [
                     'tag' => 'google',
-                    'type' => 'udp',
-                    'server' => '8.8.8.8'
+                    'type' => 'https',
+                    'server' => '8.8.8.8',
+                    'detour' => $finalOutbound,
+                    'tls' => [
+                        'enabled' => true,
+                        'server_name' => 'dns.google'
+                    ]
                 ]
             ],
             'final' => 'cloudflare',
-            'strategy' => 'ipv4_only'
+            'strategy' => 'prefer_ipv4'
         ],
         'inbounds' => [
             [
                 'type' => 'tun',
                 'tag' => 'tun-in',
-                'address' => ['172.19.0.1/30'],
+                'address' => ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'],
                 'auto_route' => true,
                 'strict_route' => true,
                 'stack' => 'system'
@@ -279,9 +293,15 @@ try {
         'outbounds' => $outbounds,
         'route' => [
             'auto_detect_interface' => true,
+            'rules' => [
+                [
+                    'port' => 53,
+                    'action' => 'hijack-dns'
+                ]
+            ],
             'default_domain_resolver' => [
                 'server' => 'cloudflare',
-                'strategy' => 'ipv4_only'
+                'strategy' => 'prefer_ipv4'
             ],
             'final' => $finalOutbound
         ]

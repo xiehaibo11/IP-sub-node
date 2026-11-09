@@ -2,35 +2,31 @@
 
 ## Project Structure & Module Organization
 
-- `api/vpn/` contains public PHP VPN subscription endpoints such as `sub.php`, `clash.php`, and `info.php`.
-- `api/ws/` contains the Node.js websocket service, its `package.json`, lockfile, browser test page, and related PHP callbacks.
-- `private/` contains shared PHP configuration and CLI helpers. Keep secrets out of this directory; load them from `.env`.
+- `api/vpn/` contains public PHP VPN subscription endpoints such as `clash.php`, `hiddify.php`, and `sub.php`.
+- `private/` contains shared PHP configuration. Keep secrets out of this directory; load them from `.env`.
 - `docs/` contains operational documentation. `deploy/` contains deployment examples such as nginx configuration.
-- Root files include `.env.example` for required environment variables and `ecosystem.config.js` for PM2 process management.
+- Root files include `.env.example` for required environment variables.
+- The project contains only VPN subscription distribution. Runtime services are nginx, PHP-FPM, MySQL/MariaDB, Xray, and sing-box, managed by systemd.
 
 ## Build, Test, and Development Commands
 
-- `cd api/ws && npm install` installs websocket service dependencies from `package-lock.json`.
-- `cd api/ws && node websocket-server.js` runs the websocket service locally using `.env` from the repository root.
-- `pm2 start ecosystem.config.js` starts the production-style PM2 app defined at the root.
-- `find . -name "*.php" -not -path "./api/ws/node_modules/*" -print0 | xargs -0 -n1 php -l` checks PHP syntax.
-- `cd api/ws && node -c websocket-server.js && node -c keepalive-policy.js` checks JavaScript syntax.
+- `find . -name "*.php" -print0 | xargs -0 -n1 php -l` checks PHP syntax.
 
 ## Coding Style & Naming Conventions
 
 - PHP uses 4-space indentation, small endpoint scripts, and shared configuration via `require_once __DIR__ . '/../../private/app_config.php';`.
-- JavaScript uses CommonJS (`require`, `module.exports`), 2-space indentation, semicolons, and environment-driven constants near the top of files.
+- `clash.php` and `hiddify.php` each implement client lookup and node settings; keep both subscription formats in sync when changing node options.
 - Keep environment variable names uppercase with underscores, matching `.env.example` and `private/app_config.php`.
 - Prefer prepared PDO statements for database access and explicit response helpers for HTTP status and content type.
 
 ## Testing Guidelines
 
-There is no dedicated test suite in this repository yet. Before submitting changes, run the PHP and JavaScript syntax checks above. For endpoint changes, verify responses manually with `curl` using non-production tokens. For websocket changes, run `node websocket-server.js` and test connection, auth, and keepalive behavior with a local client.
+There is no dedicated test suite in this repository yet. Before submitting changes, run the PHP syntax check above. For endpoint changes, verify authenticated `/sub/client.yaml` and `/sub/mobile.json`, missing/wrong token rejection, and both native client parsers. Legacy token paths require the current deployment token. Preserve the HTTP 410 response from the disabled WireGuard download endpoint. For routing changes, test actual IPv4/IPv6 TCP and UDP egress; a running TUN does not prove an operating-system kill switch remains active after the core exits.
 
 ## Commit & Pull Request Guidelines
 
-The current history uses short, imperative commit messages, for example `Keep documentation focused on VPN deployment`. Follow that style and keep commits scoped to one concern. Pull requests should include a concise summary, affected paths, deployment or configuration changes, manual test results, and linked issues when applicable. Include screenshots only for browser-facing changes such as `api/ws/index.html`.
+The current history uses short, imperative commit messages, for example `Keep documentation focused on VPN deployment`. Follow that style and keep commits scoped to one concern. Pull requests should include a concise summary, affected paths, deployment or configuration changes, manual test results, and linked issues when applicable.
 
 ## Security & Configuration Tips
 
-Never commit `.env`, credentials, VPN keys, tokens, generated client configs, or audit logs. Update `.env.example` when adding configuration. Keep websocket admin controls protected by `WS_ADMIN_TOKEN` and trusted network settings.
+Never commit `.env`, credentials, VPN keys, tokens, generated client configs, or audit logs. Update `.env.example` when adding configuration.

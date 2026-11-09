@@ -1,539 +1,227 @@
 # Production VPN Subscription Runbook
 
-本文档是当前线上部署的准则。不要按旧 WireGuard 单协议文档部署当前项目。
+本文档说明统一订阅认证、服务器部署和流量排障。订阅由 nginx/PHP-FPM 提供，节点由 Xray 和 sing-box 承载，数据库使用 MySQL/MariaDB，各服务由 systemd 管理。操作生产环境时保留现有 `.env`、数据库和用户正在使用的节点凭据。
 
-目标是让新开发者从空服务器开始部署时，清楚知道每一层流量怎么走、每个端口由谁监听、订阅为什么分成桌面端和手机端，以及遇到超时应该先查哪里。
+## 1. 统一地址与格式选择
 
-## 1. 当前结论
-
-当前生产架构不是单纯 WireGuard。
-
-线上按客户端类型分发两个订阅：
-
-- 桌面端 Clash/Mihomo/Clash Verge/Clash Mi：`/sub/client.yaml`
-- 手机端 Hiddify/sing-box：`/sub/mobile.json`
-
-线上按网络环境提供三个节点：
-
-- `VLESS WS TLS 443`：手机移动网络优先，走标准 HTTPS 443，经 nginx 转发到本机 Xray。
-- `Hysteria2 UDP 8443`：速度优先，适合 UDP 没被限制的网络。
-- `VLESS TCP TLS 8443`：基础 TCP TLS 节点，作为兜底。
-
-不要再把所有客户端都导入同一个 `/sub` 地址，也不要依赖 User-Agent 自动判断格式。Clash 和 Hiddify 要拿不同的配置格式。
-
-## 2. 流量路径
-
-### 2.1 订阅获取路径
-
-桌面端：
+所有客户端使用同一个 HTTPS 地址：
 
 ```text
-Clash/Mihomo/Clash Verge
-  -> https://DOMAIN/sub/client.yaml
-  -> nginx rewrite
-  -> /api/vpn/clash.php?token=TOKEN
-  -> MySQL vpn_clients 校验 token
-  -> 输出 Clash YAML
+https://DOMAIN/sub/<64位小写十六进制token>
 ```
 
-手机端：
+同一份有效凭据授权整个节点集合。Clash/Mihomo 客户端获得 YAML，Hiddify/sing-box 客户端获得 JSON；两个可选协议启用后，两种格式都包含 VLESS TCP TLS、VLESS WebSocket TLS 和 Hysteria2 三个节点。
+
+`api/vpn/auto.php` 的格式选择顺序为：
+
+1. `format=clash|mihomo|clash-meta` 或 `format=hiddify|sing-box|singbox`。
+2. User-Agent 中的 Hiddify/sing-box 或 Clash/Mihomo 标识。
+3. Accept 包含 `application/json` 时返回 sing-box JSON。
+4. 其余请求默认返回 Clash YAML。
+
+例如不识别客户端标识时，可在同一订阅地址后加 `?format=singbox`。格式参数不替代认证。
+
+以下入口共享 `private/subscription_auth.php` 门禁：
+
+| 入口 | 认证方式 |
+| --- | --- |
+| `/sub/<token>` | 路径 token；可协商格式 |
+| `/sub`、`/api/vpn/auto.php` | Bearer 或 query token；可协商格式 |
+| `/sub/client.yaml`、`/api/vpn/clash.php` | Bearer 或 query token；固定 YAML |
+| `/sub/mobile.json`、`/api/vpn/hiddify.php` | Bearer 或 query token；固定 JSON |
+| `/sub/<token>/client.yaml`、`/sub/<token>/mobile.json` | 验证路径 token；固定格式 |
+| `/api/vpn/info.php` | 相同 Bearer 或 query token；元数据 JSON |
+
+认证优先使用 `Authorization: Bearer <token>`，其次 `?token=<token>`，最后读取受支持路径中的 token。提供多个来源时应保持一致；优先来源错误不会尝试其他凭据。旧数据库 token 不自动获得访问权，旧路径中的 token 必须匹配当前部署哈希。
+
+缺失或错误凭据返回 401；认证哈希未配置或非法返回 503；认证通过但没有启用且未过期的 `vpn_clients` 记录时返回 404。未定义路径仍可由 nginx 返回 404。`api/vpn/sub.php` 是已停用的 WireGuard 下载接口，固定返回 410。
+
+## 2. Token 生成、存储与轮换
+
+使用密码学随机数生成 32 个字节，编码为 64 位小写十六进制 token。HTTPS 提供传输加密；服务端只保存 SHA-256 哈希并进行恒定时间比较。
+
+在私密管理终端生成变量，不回显 token：
+
+```sh
+set +x
+SUBSCRIPTION_TOKEN="$(openssl rand -hex 32)"
+SUBSCRIPTION_TOKEN_SHA256="$(printf '%s' "$SUBSCRIPTION_TOKEN" | openssl dgst -sha256 -r | cut -d ' ' -f 1)"
+```
+
+通过私密渠道将 token/完整订阅地址交付客户端；将哈希写入服务器 `.env` 的 `SUBSCRIPTION_TOKEN_SHA256`，不要将 token 本体写入 `.env`、Git、文档或日志。管理终端完成交付后清除变量。节点 UUID、HY2 密码、数据库密码继续按各自配置管理，不能用订阅哈希替代。
+
+轮换时生成新 token，替换服务端哈希并确认新的 HTTP 请求读取了新配置，向客户端更新统一地址，然后确认旧 token 已返回 401。当前实现仅接受一个部署级 token。轮换订阅 token 会阻止旧订阅继续下载，但不会撤销已下载的节点凭据；泄露节点配置时还须同步轮换 Xray/sing-box 与 `.env` 的节点认证信息。
+
+## 3. 请求和中转路径
 
 ```text
-Hiddify
-  -> https://DOMAIN/sub/mobile.json
-  -> nginx rewrite
-  -> /api/vpn/hiddify.php?token=TOKEN
-  -> MySQL vpn_clients 校验 token
-  -> 输出 sing-box JSON
+客户端 HTTPS /sub/<token>
+  -> nginx -> auto.php -> 验证 SHA-256
+  -> 选择首条启用且未过期的 vpn_clients 记录
+  -> 根据客户端格式输出全部已启用节点
+
+客户端业务 TCP/UDP + DNS
+  -> 客户端 TUN / 本机代理入口
+  -> VLESS UUID 或 Hysteria2 密码认证
+  -> nginx + 本机 Xray / Xray / sing-box
+  -> 服务器系统路由 -> 实际网络接口与网关
+  -> 公网目标
 ```
 
-token 只用于订阅授权。不要把真实 token 提交到 Git。
+WebSocket 路径是 `443/tcp nginx -> 127.0.0.1:10086 Xray`。VLESS TCP TLS 直接到 `8443/tcp Xray`，Hysteria2 到 `8443/udp sing-box`。服务器中的 `freedom`/`direct` outbound 表示通过服务器网络栈访问目标，随后经过系统网关；它与客户端绕过 VPN 的 `DIRECT` 策略不同。
 
-### 2.2 代理数据路径
+用 `ip -4 route get 1.1.1.1` 读取 IPv4 下一跳；它并非验证 HTTP token 的应用代理。订阅 token 在 PHP 验证，代理隧道 UUID/密码在节点验证。若改为另一台带用户名/密码的内网代理，需另外配置其协议、地址、认证与出站链路，并验证没有服务器直连回退。
 
-手机优先路径，最稳：
+IPv6 下一跳应单独读取系统路由，不能把 IPv4 网关验证当成 IPv6 网关验证。DNS 公共解析器和目标网站应看到服务器出口；VPN 服务器作为连接对端仍会看到客户端来源 IP。
 
-```text
-Hiddify
-  -> VLESS + WebSocket + TLS
-  -> DOMAIN:443
-  -> nginx TLS 入口
-  -> exact WebSocket location
-  -> http://127.0.0.1:10086
-  -> Xray mobile-ws-in
-  -> direct outbound
-```
+需要双栈出口时，不要给 Xray Freedom 同时设置固定 IPv4 `sendThrough` 与 `sockopt.domainStrategy: ForceIPv4`，否则只有 AAAA 的目标无法连接。需要优先 IPv4 时可使用 `UseIPv4v6`，并由系统为对应地址族选择源地址；修改前后分别测试 TCP、WS 的 IPv4/IPv6，不能用 HY2 的成功替代它们的验证。
 
-加速路径，依赖 UDP：
+## 4. 端口与环境配置
 
-```text
-Hiddify 或 Mihomo
-  -> Hysteria2
-  -> DOMAIN:8443/udp
-  -> sing-box@hy2
-  -> direct outbound
-```
+| 端口 | 服务 | 限制 |
+| --- | --- | --- |
+| `443/tcp` | nginx HTTPS/WSS | 对公网开放 |
+| `8443/tcp` | Xray VLESS TLS | 对公网开放，验证 UUID |
+| `8443/udp` | sing-box HY2 | 对公网开放，验证密码 |
+| `127.0.0.1:10086/tcp` | Xray VLESS WS | 仅本机 nginx 可连接 |
+| `22/tcp` | SSH | 限定管理来源 |
+| 本机数据库/PHP-FPM | MariaDB/socket | 不对公网提供访问 |
 
-TCP 兜底路径：
+按实际应用补充 ACME 证书更新所需的 80/tcp；80 上的订阅路径不接收凭据，也不通过重定向处理凭据。客户端必须直接使用 HTTPS。
 
-```text
-Clash/Mihomo/Hiddify
-  -> VLESS + TCP + TLS
-  -> DOMAIN:8443/tcp
-  -> Xray vless inbound
-  -> direct outbound
-```
-
-## 3. 端口归属
-
-| 端口 | 协议 | 进程 | 用途 |
-| --- | --- | --- | --- |
-| `443/tcp` | HTTPS / WSS | nginx | 订阅、网站、VLESS WS TLS 入口 |
-| `10086/tcp` | VLESS WS 明文内环 | Xray | 只监听 `127.0.0.1`，由 nginx 反代 |
-| `8443/tcp` | VLESS TCP TLS | Xray | 桌面和兜底节点 |
-| `8443/udp` | Hysteria2 | sing-box | 加速节点 |
-| `8080/tcp` | WebSocket app | Node.js | 项目原 websocket 服务，按需 PM2 管理 |
-
-安全组至少放行：
-
-```text
-443/tcp
-8443/tcp
-8443/udp
-22/tcp 只给管理 IP
-```
-
-`10086/tcp` 不要对公网监听。
-
-## 4. 必备环境变量
-
-从 `.env.example` 复制：
+仅首次部署时复制 `.env.example`，已有生产环境应更新必要字段而不是覆盖整个文件：
 
 ```sh
 cp .env.example .env
+sudo chown www-data:www-data .env
 chmod 600 .env
 ```
 
-必须配置：
+将属主替换为实际 PHP-FPM pool 用户；`600` 文件必须可被该用户读取。只更改权限而保留 `root` 属主会让 PHP 无法加载认证哈希，订阅返回 503。
 
-```ini
-DB_HOST=127.0.0.1
-DB_USER=...
-DB_PASSWORD=...
-DB_NAME=clients
+必须配置 `DB_HOST`、`DB_USER`、`DB_PASSWORD`、`DB_NAME`、`SUBSCRIPTION_TOKEN_SHA256`，以及 `SUBSCRIPTION_NODE_UUID/HOST/PORT/SNI/NAME`。要分发完整三节点集合，还需：
 
-SUBSCRIPTION_NODE_UUID=...
-SUBSCRIPTION_NODE_HOST=DOMAIN
-SUBSCRIPTION_NODE_PORT=8443
-SUBSCRIPTION_NODE_SNI=DOMAIN
-SUBSCRIPTION_NODE_NAME=美国-client1
+- `MOBILE_WS_ENABLED=true`，配置 `MOBILE_WS_PORT/LOCAL_PORT/PATH/HOST/SNI/NAME`。
+- `HYSTERIA2_ENABLED=true`，配置 `HYSTERIA2_PORT/PASSWORD/OBFS_PASSWORD/NAME` 和带宽参数。
 
-HYSTERIA2_ENABLED=true
-HYSTERIA2_NAME=美国-HY2
-HYSTERIA2_PORT=8443
-HYSTERIA2_PASSWORD=...
-HYSTERIA2_OBFS_PASSWORD=...
-HYSTERIA2_UP_MBPS=100
-HYSTERIA2_DOWN_MBPS=500
+`MOBILE_WS_PATH` 必须同时匹配 `.env`、nginx exact location、Xray `wsSettings.path`。证书应覆盖 SNI 域名；不要关闭 TLS 证书校验。现有订阅不设置 Vision flow，服务端也不要单方面要求 `xtls-rprx-vision`。
 
-MOBILE_WS_ENABLED=true
-MOBILE_WS_NAME=美国-443
-MOBILE_WS_PORT=443
-MOBILE_WS_LOCAL_PORT=10086
-MOBILE_WS_PATH=/api/your-private-ws-path
-MOBILE_WS_HOST=DOMAIN
-MOBILE_WS_SNI=DOMAIN
-```
+## 5. 数据库与服务部署
 
-`MOBILE_WS_PATH` 必须同时出现在三处：
+项目发布目录为 `/var/www/IP-sub-node`。仅在空数据库导入 `database/schema.sql`，它包含 `DROP TABLE`，不能用于更新已有生产数据库。通过私有管理渠道配置至少一条启用且未过期的 `vpn_clients` 记录，并满足当前表的非空约束。
 
-- `.env` 的 `MOBILE_WS_PATH`
-- nginx 的 exact `location = /api/your-private-ws-path`
-- Xray WebSocket inbound 的 `wsSettings.path`
+两个 renderer 与 info 都按 id 使用首条有效记录。数据库中的旧 WireGuard 字段和旧 token 字段为兼容结构；订阅访问授权由 `.env` 中的部署级哈希控制。生产行数据不得提交 Git。
 
-三处任何一个不一致，手机 443 节点会超时或 404。
+使用 `deploy/nginx-secure-example.conf` 配置实际域名、证书、PHP-FPM socket 和 WS path。务必部署 `private/subscription_auth.php`，并将 `HTTP_AUTHORIZATION` 转发给 PHP-FPM。仅开放所需端点，其余路径返回 404；`.env`、数据库文件和 private 目录不能通过站点访问。
 
-## 5. 数据库初始化
+Xray 提供 TLS 8443 与 loopback WS 10086 两个入站，UUID 与 `.env` 一致。sing-box 提供 HY2 UDP 8443，用户密码、salamander 密码和证书配置与 `.env` 一致。systemd unit 与配置文件路径以实际 `ExecStart` 为准；当前服务名使用 `sing-box`，不要假设存在 `sing-box@hy2` 模板实例。
 
-新服务器创建数据库后导入结构：
+变更后先验证，再 reload/restart 受影响服务；不要为仅 PHP 输出变更重启所有 VPN 核心：
 
 ```sh
-mysql -u "$DB_USER" -p -e "CREATE DATABASE IF NOT EXISTS clients CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-mysql -u "$DB_USER" -p clients < database/schema.sql
+sudo nginx -t
+sudo xray run -test -c /usr/local/etc/xray/config.json
+sudo sing-box check -c /etc/sing-box/config.json
+systemctl is-active nginx xray sing-box php8.3-fpm mariadb
+ip -4 route get 1.1.1.1
+ip -6 route
 ```
 
-必须有 `vpn_clients` 可用记录，否则订阅接口会返回 `404 subscription not found`。
+其中路径、PHP 版本和数据库 unit 名需按服务器实际安装调整。只有 nginx 配置变化时执行 `sudo systemctl reload nginx`；核心配置变化时，在原生校验通过后重启相应 unit 并复查监听与连通性。
 
-最少需要这些字段有效：
+默认策略选择 `AUTO`，不要把存在自动组等同于当前已使用它。Mihomo 的 `AUTO` 使用 `url-test`：每 30 秒检查一次，单次超时 3 秒、要求 HTTP 204，切换容差为 30 ms。手机端使用 30 秒 `urltest`、30 ms 容差，并保留已有连接。测速只比较探测目标的延迟；它不测下载带宽，也不保证每个目标都获得最低延迟。手动指定单个节点时，该连接不会自动改走其他节点。
 
-- `client_name`
-- `username`
-- `vpn_address`
-- `private_key`
-- `public_key`
-- `preshared_key`
-- `server_public_key`
-- `endpoint_host`
-- `endpoint_port`
-- `token`
-- `enabled = 1`
+Mihomo 全局模式的 `GLOBAL` 首选 `AUTO`，直接进入健康检查与自动选择，不依赖 `PROXY` 的手动选择。客户端更新订阅后还应检查内核实际生效的组类型、检查间隔与 `now`：`AUTO` 应为 `url-test`、间隔 30 秒，`GLOBAL` 和 `PROXY` 应选择 `AUTO`。Clash Verge 的应用设置与 DNS 覆写可能覆盖订阅参数，应读取内核 `/configs`、策略组和实际出口。只修改订阅源文件或只看到下载成功，不能证明运行内核已加载新配置。
 
-当前 VLESS/HY2 订阅主要使用 token 校验和客户端命名。旧 WireGuard 字段仍在表里，是兼容旧逻辑，不代表当前生产流量走 WireGuard。
+`private/subscription_client.php` 复用每个 PHP worker 的数据库连接；每次下载都重新检查 enabled/expiry，避免缓存撤销决定。SELECT 不再读取旧 VPN 私钥字段；访问时间按 60 秒节流，并用 UPDATE 条件防止并发重复写入。PHP OPcache 可缓存脚本编译结果，部署后必须确认新代码已生效。
 
-生产行数据不要放进 Git，因为里面有 VPN key 和订阅 token。
+高并发 WS 需要同时检查 nginx 的 `worker_connections` 与 worker 文件句柄上限：每个代理连接至少消耗客户端、上游两个连接。可在 main 上下文设置 `worker_rlimit_nofile 65536;`，events 中设置 `worker_connections 8192;`，服务 LimitNOFILE 不低于该值；原生校验通过后 reload 并读取实际 worker limits。该配置是资源上限，不是并发用户数保证。TLS 会话缓存与 WS 无缓冲配置见 nginx 模板。订阅 HTTP 限流保留 10 r/s、burst 20，明确返回 429，不能用放宽订阅限流替代代理吞吐优化。
 
-## 6. nginx 配置要点
+QUIC 的 UDP socket 缓冲区受 Linux `net.core.rmem_max/wmem_max` 限制。依据 quic-go 文档与实测调整上限，不必同步放大默认分配量；修改后重建 QUIC socket 并验证丢包与吞吐。带宽时延积 `带宽(bit/s) × RTT(s) / 8` 用于估算在途数据量，不等于应为每个 socket 分配相同内存，也不能把虚拟机回环吞吐当成公网带宽。
 
-订阅短链：
+`HYSTERIA2_UP_MBPS` 与 `HYSTERIA2_DOWN_MBPS` 默认均为 `0`，两份订阅会省略固定带宽字段并使用自适应 BBR。只有两项都为正值时才声明固定带宽；应依据实测链路设置，不能把该声明当作云服务器已购买的带宽。网络波动排查需同时比较客户端到节点与服务器到公网的延迟、丢包和错误，避免只根据历史累计重传调内核参数。
 
-```nginx
-location = /sub/client.yaml {
-    rewrite ^ /api/vpn/clash.php?token=CHANGE_ME_64_HEX_TOKEN last;
-}
+## 6. DNS、UDP 与本地 IP 防泄露
 
-location = /sub/mobile.json {
-    rewrite ^ /api/vpn/hiddify.php?token=CHANGE_ME_64_HEX_TOKEN last;
-}
+两种订阅都在服务器上将节点地址解析为 IPv4，再把该 IP 固定到生成配置；TLS SNI 和 WS Host 保留域名。解析失败返回 503，避免客户端为建立首条隧道而通过本地 DNS 查询节点。节点 IP 发生变化时需刷新订阅。
 
-location ~ "^/sub/([a-f0-9]{64})/client\.yaml$" {
-    rewrite "^/sub/([a-f0-9]{64})/client\.yaml$" /api/vpn/clash.php?token=$1 last;
-}
+Clash/Mihomo 使用 fake-ip；默认 DNS、节点 DNS 和业务 DNS 均显式使用经 `PROXY` 的 IP 地址 DoH。`respect-rules` 配合非空 `proxy-server-nameserver`，避免 bootstrap 循环。fake-ip-filter 只决定返回真实地址还是 fake-ip，不授予直连权限。策略组没有 `DIRECT`，最终规则为 `MATCH,PROXY`，且不保存旧的手动直连选择。
 
-location ~ "^/sub/([a-f0-9]{64})/mobile\.json$" {
-    rewrite "^/sub/([a-f0-9]{64})/mobile\.json$" /api/vpn/hiddify.php?token=$1 last;
-}
-```
+sing-box 使用 typed HTTPS DNS server，地址为 IP、TLS server name 为解析器域名，并显式 `detour` 到最终认证节点或策略组。端口 53 请求通过 `hijack-dns` 进入该 DNS 模块，不使用直连 UDP DNS。两个 VLESS outbound 不限制为 TCP-only，保留 XUDP；底层 TCP/WS 传输仍照常使用。
 
-VPN PHP endpoint：
+两端 TUN 均包含 IPv4/IPv6 接管和严格路由；Clash DNS 包含 IPv6 fake-ip 范围，sing-box 使用 prefer_ipv4 并保留 AAAA 解析。客户端必须实际开启 TUN/VPN，核对其有效配置，防止 UI、merge、排除应用或路由绕过覆盖订阅。配置应使用实际安装的核心进行校验，不照抄较新版本专有字段。
 
-```nginx
-location ~ ^/api/vpn/(auto|clash|hiddify|sub|info)\.php$ {
-    include snippets/fastcgi-php.conf;
-    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-    fastcgi_pass unix:/run/php/php8.3-fpm.sock;
-}
-```
+严格路由只覆盖核心运行期间已接管的流量。VPN 关闭、核心崩溃或系统恢复普通路由后，要继续阻止直连，必须启用操作系统支持的断网策略。例如 Android 使用“始终开启 VPN”与“阻止未使用 VPN 的连接”；macOS/Windows 需要独立的系统防火墙或客户端提供的持久断网功能，并测试退出、重启和换网场景。[Android VPN 文档](https://developer.android.com/develop/connectivity/vpn#blocked_connections)
 
-手机 443 WebSocket fallback：
+WebRTC 检查要区分：网页通过 STUN 得到的真实公网 IP，和浏览器上报的 `192.168.*` 等私网 host candidate。隧道接管前者；后者属于浏览器地址暴露策略，可能还需浏览器限制非代理 UDP/本地候选。仅封锁几个 STUN 端口不足以证明防泄露。[RFC 8828](https://datatracker.ietf.org/doc/html/rfc8828#section-5.2)
 
-```nginx
-location = /api/your-private-ws-path {
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_read_timeout 3600s;
-    proxy_send_timeout 3600s;
-    proxy_pass http://127.0.0.1:10086;
-}
-```
+## 7. 不泄露凭据的验证
 
-注意：
-
-- WebSocket location 要用实际 `MOBILE_WS_PATH`。
-- 不能被敏感文件拦截规则误伤。
-- `proxy_set_header Upgrade` 和 `Connection "upgrade"` 必须存在。
-- 如果网站 root 不是仓库目录，`SCRIPT_FILENAME` 必须能找到 `api/vpn/*.php`。
-
-验证：
+先运行 PHP 语法检查：
 
 ```sh
-nginx -t
-systemctl reload nginx
+find api private -name '*.php' -print0 | xargs -0 -n1 php -l
 ```
 
-HTTPS 站点安全头必须包含 HSTS，避免用户先访问 HTTP 或浏览器历史缓存导致地址栏显示“不安全”：
+以下为 Bash 示例。先关闭调试，再从终端静默读取 token；不将 token 写入命令历史、进程参数中的 URL 或输出。临时配置含节点凭据，必须权限受限并在结束后删除：
 
-```nginx
-add_header Strict-Transport-Security "max-age=31536000" always;
+```bash
+set +x
+umask 077
+VPN_BASE_URL='https://DOMAIN'
+IFS= read -r -s SUBSCRIPTION_TOKEN
+VPN_CHECK_DIR="$(mktemp -d)"
+trap 'rm -rf "$VPN_CHECK_DIR"; unset SUBSCRIPTION_TOKEN' EXIT
+
+curl --silent --output /dev/null --write-out 'unauthenticated: %{http_code}\n' "$VPN_BASE_URL/sub"
+printf 'header = "Authorization: Bearer %s"\n' "$(printf '%064d' 0)" |
+    curl --config - --silent --output /dev/null \
+        --write-out 'wrong token: %{http_code}\n' "$VPN_BASE_URL/sub"
+
+printf 'header = "Authorization: Bearer %s"\n' "$SUBSCRIPTION_TOKEN" |
+    curl --config - --silent --show-error --fail -A 'mihomo' \
+        --output "$VPN_CHECK_DIR/client.yaml" \
+        --write-out 'Clash: %{http_code}\n' "$VPN_BASE_URL/sub"
+printf 'header = "Authorization: Bearer %s"\n' "$SUBSCRIPTION_TOKEN" |
+    curl --config - --silent --show-error --fail -A 'Hiddify' \
+        --output "$VPN_CHECK_DIR/mobile.json" \
+        --write-out 'sing-box: %{http_code}\n' "$VPN_BASE_URL/sub"
+
+mihomo -t -d "$VPN_CHECK_DIR" -f "$VPN_CHECK_DIR/client.yaml"
+sing-box check -c "$VPN_CHECK_DIR/mobile.json"
+rm -rf "$VPN_CHECK_DIR"
+unset SUBSCRIPTION_TOKEN
+trap - EXIT
 ```
 
-确认：
+预期前两个状态为 401，后两个为 200。不要用 `curl -v`、`set -x`、`cat` 或 `sed` 把认证头、完整订阅 URL、UUID、HY2 密码和生成配置打印到共享终端。路径 token、query token 和 info 接口也要验证；日志或测试报告只保留状态、节点数量和成功/失败结论。
 
-```sh
-curl -I https://DOMAIN/sub/client.yaml | rg -i 'strict-transport-security|http/'
-```
+完整验收还应包括：
 
-## 7. Xray 配置要点
+- 同一条 `/sub/<token>` 在实际 Clash/Hiddify 中均可导入，并显示全部三个节点；Accept/format 协商符合预期。
+- 错误、缺失、撤销 token 不能下载任何格式或 info，敏感路径返回 404，WireGuard 返回 410。
+- 三个节点分别测试 TCP、UDP 和公网 IPv4/IPv6 出口；DNS 经认证隧道，服务器路由经过预期网关。
+- 使用实际浏览器检查 WebRTC 公网候选及私网候选，分别记录结论。
+- 测试节点故障时不回退客户端直连；独立验证 VPN 退出、核心崩溃和换网后的系统断网策略。
 
-Xray 至少要有两个 inbound：
+下载成功、核心配置校验通过、服务 active 与真实业务请求成功是不同的验证结果，应分别确认。
 
-- `8443/tcp`：VLESS TCP TLS。
-- `127.0.0.1:10086`：VLESS WebSocket，给 nginx 443 fallback 使用。
+## 8. 日志与常见故障
 
-VLESS 用户 UUID 必须等于 `.env` 的 `SUBSCRIPTION_NODE_UUID`。
+nginx 使用模板中的脱敏 `vpn_safe` 日志格式：屏蔽路径 token，排除 query string、Authorization 和 Referer。PHP endpoint 使用受限错误日志策略，避免上游错误自动拼入原始订阅 URL。前置 CDN、负载均衡器和监控也应检查相同字段；不要把未经脱敏的历史请求日志复制到工单。保留必要的服务错误计数与状态，避免靠打印请求凭据排障。
 
-重要坑点：不要随便加 `xtls-rprx-vision` flow。如果客户端订阅没有输出 `flow`，服务端却要求 Vision flow，Xray 会拒绝连接。当前配置使用普通 VLESS TLS，不设置 flow。
+WS 连接成功时可在脱敏访问日志中看到 101；检查核心日志时仅在私密终端读取，不转贴来源 IP、节点凭据或原始请求。实际监听可用 `sudo ss -lntup` 核对，10086 必须只绑定 loopback。
 
-WebSocket inbound 只监听本机：
+| 现象 | 排查与处理 |
+| --- | --- |
+| 订阅 401 | 核对 token 来源和当前哈希；检查 PHP-FPM 是否收到 Authorization，不打印凭据 |
+| 订阅 503 | 检查哈希格式、节点配置和服务器侧 IPv4 解析，不添加本地 DNS 回退 |
+| 订阅 404 | 先区分未定义路径与有效认证后无可用数据库记录 |
+| 客户端拿错格式 | 使用正确 User-Agent/Accept，或在统一地址加 `format=clash|singbox` |
+| 443 WS 返回 404/502 | 核对三处 WS path 及本机 Xray 10086 监听 |
+| VLESS TCP 可用但 UDP 失败 | 核对 XUDP、服务端 UDP 支持与客户端实际配置，避免误加 TCP-only 限制 |
+| HY2 在移动网络超时 | 核对 UDP 8443、安全组与运营商限制；选择同一订阅中的 WS 443 节点 |
+| 实际出口仍是本地 IP | 核对 TUN/VPN 是否生效、IPv6、排除应用、DNS detour、客户端覆盖配置和浏览器 WebRTC |
+| 轮换后旧节点仍能用 | 订阅 token 只控制下载，需另外轮换已经泄露的节点 UUID/密码 |
 
-```json
-{
-  "tag": "mobile-ws-in",
-  "listen": "127.0.0.1",
-  "port": 10086,
-  "protocol": "vless",
-  "settings": {
-    "clients": [
-      {
-        "id": "SUBSCRIPTION_NODE_UUID",
-        "email": "mobile"
-      }
-    ],
-    "decryption": "none"
-  },
-  "streamSettings": {
-    "network": "ws",
-    "security": "none",
-    "wsSettings": {
-      "path": "/api/your-private-ws-path"
-    }
-  }
-}
-```
-
-验证：
-
-```sh
-xray run -test -c /usr/local/etc/xray/config.json
-systemctl restart xray
-systemctl is-active xray
-```
-
-日志：
-
-```sh
-journalctl -u xray -n 100 --no-pager
-```
-
-## 8. sing-box Hysteria2 配置要点
-
-HY2 监听 `8443/udp`，密码和 obfs 密码来自 `.env`：
-
-```json
-{
-  "inbounds": [
-    {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "::",
-      "listen_port": 8443,
-      "users": [
-        {
-          "password": "HYSTERIA2_PASSWORD"
-        }
-      ],
-      "obfs": {
-        "type": "salamander",
-        "password": "HYSTERIA2_OBFS_PASSWORD"
-      },
-      "tls": {
-        "enabled": true,
-        "server_name": "DOMAIN",
-        "certificate_path": "/etc/letsencrypt/live/DOMAIN/fullchain.pem",
-        "key_path": "/etc/letsencrypt/live/DOMAIN/privkey.pem",
-        "alpn": ["h3"]
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-```
-
-验证：
-
-```sh
-sing-box check -c /etc/sing-box/hy2.json
-systemctl restart sing-box@hy2
-systemctl is-active sing-box@hy2
-```
-
-如果手机流量下 HY2 超时，不代表 Hiddify 不支持 HY2。更常见原因是运营商限制 UDP 或该网络对 UDP 8443 不稳定。此时让手机优先使用 `美国-443`。
-
-## 9. 内核和系统优化
-
-建议启用 BBR、fq、TCP Fast Open 和更大的 buffer：
-
-```conf
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_keepalive_time = 120
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 3
-```
-
-写入 `/etc/sysctl.d/99-xray-performance.conf` 后执行：
-
-```sh
-sysctl --system
-sysctl net.ipv4.tcp_congestion_control
-tc qdisc show dev "$(ip route show default | awk '{print $5; exit}')"
-```
-
-如果服务器没有可用 IPv6 出口，订阅里要关闭 IPv6 或强制 IPv4。否则客户端可能出现 DNS 能解析、HTTP/TLS 握手超时。
-
-## 10. 客户端导入规则
-
-桌面 Clash/Mihomo/Clash Verge/Clash Mi：
-
-```text
-https://DOMAIN/sub/client.yaml
-```
-
-手机 Hiddify：
-
-```text
-https://DOMAIN/sub/mobile.json
-```
-
-手机端排障时必须这样做：
-
-1. 删除旧 profile，不要只点刷新。
-2. 重新导入 `/sub/mobile.json`。
-3. 手动选择 `美国-443`。
-4. 关闭 Hiddify 里的 WARP、链式代理或前置代理。
-5. 移动流量下先测 `美国-443`，再测 HY2。
-
-如果 Hiddify 页面显示 `WARP -> 美国-client1`，说明它不是直连节点，而是先走 WARP 再连节点。这种链式路径容易在移动网络握手超时，不能作为节点本身是否正常的判断依据。
-
-## 11. fake-ip 和规则
-
-Clash/Mihomo 订阅使用 fake-ip：
-
-```yaml
-dns:
-  enable: true
-  ipv6: false
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-```
-
-fake-ip 用来减少 DNS 污染影响，并提升规则路由性能。
-
-必须保留常见过滤项：
-
-- `*.lan`
-- `*.local`
-- `localhost`
-- Apple captive portal 和 time 域名
-- NTP
-- Windows connectivity check
-- Android connectivity check
-- Firefox portal check
-
-规则最后必须有兜底：
-
-```yaml
-MATCH,PROXY
-```
-
-内网和本机地址必须直连，避免把局域网、系统探测、NTP 都代理出去。
-
-## 12. 完整验证清单
-
-服务状态：
-
-```sh
-systemctl is-active nginx xray sing-box@hy2
-```
-
-端口监听：
-
-```sh
-ss -lntup | rg ':(443|8443|10086)\b'
-```
-
-期望结果：
-
-- nginx 监听 `443/tcp`
-- Xray 监听 `8443/tcp`
-- Xray 监听 `127.0.0.1:10086/tcp`
-- sing-box 监听 `8443/udp`
-
-订阅接口：
-
-```sh
-curl -fsSL https://DOMAIN/sub/client.yaml | sed -n '1,80p'
-curl -fsSL https://DOMAIN/sub/mobile.json -o /tmp/mobile-sub.json
-sing-box check -c /tmp/mobile-sub.json
-```
-
-日志观察：
-
-```sh
-tail -n 100 /var/log/nginx/access.log
-journalctl -u xray --since '10 minutes ago' --no-pager
-journalctl -u sing-box@hy2 --since '10 minutes ago' --no-pager
-```
-
-WebSocket 443 正常时，nginx access log 能看到该 path 返回 `101`。
-
-## 13. 常见错误和正确处理
-
-| 现象 | 常见原因 | 正确处理 |
-| --- | --- | --- |
-| Clash 导入订阅失败，`failed to fetch remote profile` | `/sub` 自动判断格式、nginx rewrite、PHP token 或 TLS 问题 | 固定使用 `/sub/client.yaml`，先 `curl` 看 HTTP 状态 |
-| Clash 里节点显示 Timeout | 服务端协议和订阅不匹配，或 8443/tcp 未通 | 查 `ss`、安全组、Xray 日志 |
-| Hiddify 手机流量超时 | 还在用旧 profile、WARP 链式代理、移动网络限制 UDP 或非 443 | 删除旧 profile，重导 `/sub/mobile.json`，选 `美国-443`，关闭 WARP |
-| HY2 在 Wi-Fi 可用，手机流量不可用 | 运营商 UDP 限制 | 手机默认走 VLESS WS TLS 443，HY2 只作加速可选项 |
-| Xray 日志提示 flow 不匹配 | 服务端设置了 Vision flow，客户端没带 flow | 服务端和订阅都不要设置 Vision flow，或两边同时设置 |
-| 443 WS 连接 404 | nginx path、Xray path、`.env MOBILE_WS_PATH` 不一致 | 三处 path 完全一致 |
-| 443 WS 连接 502 | nginx 代理到 `127.0.0.1:10086`，但 Xray 没监听 | 查 Xray service 和 inbound |
-| Hiddify 能导入但没有节点 | sing-box JSON 结构不兼容或输出被错误缓存 | `curl` 下载后用 `sing-box check` 校验 |
-| 订阅返回 404 | 数据库没有 enabled token 记录或 token 过期 | 查 `vpn_clients` 记录 |
-| 速度不稳定 | IPv6 黑洞、DNS 污染、UDP 不稳、链式代理 | 关闭 IPv6、fake-ip、443 fallback、关闭 WARP |
-| 浏览器打开订阅显示“不安全”，但证书有效 | 当前标签仍是 HTTP、浏览器缓存旧安全状态，或订阅文本里出现明文 HTTP 测速 URL 造成误判 | 访问完整 `https://` 地址、清站点数据，并确保订阅里的测速 URL 使用 HTTPS |
-
-## 14. 不要再重复的旧路
-
-不要做这些事：
-
-- 不要把 WireGuard 当作当前生产主协议。
-- 不要让桌面端和手机端共用一个订阅格式。
-- 不要只看 Hiddify 支持协议列表就认为导入格式一定正确。
-- 不要让手机端默认走 HY2 或 8443，再去判断节点是否可用。
-- 不要在 Hiddify 开着 WARP 链式代理时测节点连通性。
-- 不要把 Xray Vision flow 加到服务端但不输出给客户端。
-- 不要把真实 `.env`、UUID、HY2 密码、WebSocket 私有 path、GitHub token、订阅 token、数据库行数据提交到 Git。
-- 不要只改 PHP 代码就以为部署完成；nginx、Xray、sing-box、系统端口必须一起验证。
-
-## 15. 新服务器最短部署顺序
-
-1. 安装系统依赖：nginx、PHP-FPM、MySQL/MariaDB、Node.js、PM2、Xray、sing-box。
-2. Clone 仓库到 `/var/www/IP-sub-node`。
-3. `cp .env.example .env`，填好数据库、VLESS、HY2、Mobile WS 配置。
-4. 导入 `database/schema.sql`。
-5. 插入或迁移 `vpn_clients` 的授权记录。
-6. 配置 nginx：订阅 rewrite、PHP-FPM、WebSocket fallback。
-7. 配置 Xray：8443/tcp VLESS TLS 和 127.0.0.1:10086 VLESS WS。
-8. 配置 sing-box：8443/udp HY2。
-9. 应用 sysctl 优化。
-10. 重启并校验 nginx、xray、sing-box。
-11. 用 curl 校验两个订阅。
-12. 用 Clash 导入 `/sub/client.yaml`。
-13. 用 Hiddify 删除旧 profile 后导入 `/sub/mobile.json`，优先选 `美国-443`。
-
-## 16. 交接时必须说明
-
-交接给其他开发者时，要明确告诉对方：
-
-- 这是多协议订阅分发系统，不是单 WireGuard 节点。
-- 桌面和手机订阅 URL 不一样。
-- Hiddify 手机端默认优先 443 fallback。
-- HY2 是加速项，不是移动网络唯一入口。
-- 数据库结构可以 Git 管理，生产数据不能 Git 管理。
-- 任何连接超时都必须按“订阅接口、客户端选择、nginx、Xray、sing-box、端口、安全组、日志”的顺序排查。
+新服务器按“依赖安装、环境与认证哈希、空库初始化、nginx/核心配置、原生校验、服务启动、认证检查、客户端导入、逐节点出口”顺序部署。生产变更完成后清理临时生成配置，并以实际请求结果确认服务恢复。
