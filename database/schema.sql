@@ -1,5 +1,3 @@
-/*M!999999\- enable the sandbox mode */ 
-
 /*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
 /*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;
 /*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;
@@ -40,7 +38,6 @@ CREATE TABLE `vpn_clients` (
   UNIQUE KEY `vpn_address` (`vpn_address`),
   UNIQUE KEY `public_key` (`public_key`),
   UNIQUE KEY `token` (`token`),
-  KEY `idx_vpn_clients_token` (`token`),
   KEY `idx_vpn_clients_username` (`username`)
 ) ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
