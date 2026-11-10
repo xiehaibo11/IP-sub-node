@@ -116,6 +116,8 @@ chmod 600 .env
 
 Xray 提供 TLS 8443 与 loopback WS 10086 两个入站，UUID 与 `.env` 一致。sing-box 提供 HY2 UDP 8443，用户密码、salamander 密码和证书配置与 `.env` 一致。systemd unit 与配置文件路径以实际 `ExecStart` 为准；当前服务名使用 `sing-box`，不要假设存在 `sing-box@hy2` 模板实例。
 
+两个核心都禁止客户端经代理访问私有与本机地址：Xray `routing` 把 127.0.0.0/8、10/8、172.16/12、192.168/16、169.254/16、100.64/10、::1、fc00::/7、fe80::/10 送往 `block`，sing-box `route` 用 `ip_is_private` 规则 `reject`。否则持有节点凭据的客户端可连到只监听本机的 MariaDB、Xray WS 等服务（2026-11-10 实测 HY2 可访问 127.0.0.1:10086，加规则后被拒绝）。Xray TLS 入站开启 `sockopt.tcpFastOpen`。修改配置时保持文件属主 `root:ip-sub-node`、权限 `640`，xray 与 sing-box 用户须在该组内可读。
+
 变更后先验证，再 reload/restart 受影响服务；不要为仅 PHP 输出变更重启所有 VPN 核心：
 
 ```sh
@@ -140,6 +142,10 @@ Mihomo 全局模式的 `GLOBAL` 首选 `AUTO`，直接进入健康检查与自�
 QUIC 的 UDP socket 缓冲区受 Linux `net.core.rmem_max/wmem_max` 限制。依据 quic-go 文档与实测调整上限，不必同步放大默认分配量；修改后重建 QUIC socket 并验证丢包与吞吐。带宽时延积 `带宽(bit/s) × RTT(s) / 8` 用于估算在途数据量，不等于应为每个 socket 分配相同内存，也不能把虚拟机回环吞吐当成公网带宽。
 
 `HYSTERIA2_UP_MBPS` 与 `HYSTERIA2_DOWN_MBPS` 默认均为 `0`，两份订阅会省略固定带宽字段并使用自适应 BBR。只有两项都为正值时才声明固定带宽；应依据实测链路设置，不能把该声明当作云服务器已购买的带宽。网络波动排查需同时比较客户端到节点与服务器到公网的延迟、丢包和错误，避免只根据历史累计重传调内核参数。
+
+生产环境当前为 `HYSTERIA2_UP_MBPS=30`、`HYSTERIA2_DOWN_MBPS=50`（2026-11-10 晚高峰中国移动到纽约丢包约 16%：自适应 BBR 仅 1.5–5 Mbit/s，固定速率 down 40–50 约 27–35 Mbit/s，down 100 反而降到约 9 Mbit/s）。固定速率高于线路实际容量会使吞吐崩溃，应按晚高峰实测取值。H5000M 路由器不使用订阅中的速率，自带 up 20 / down 40。
+
+`/etc/sysctl.d/90-ip-sub-node.conf` 针对约 270 ms 的长距离链路：`tcp_slow_start_after_idle=0`（空闲后不回到慢启动）、`tcp_notsent_lowat=16384`、`tcp_mtu_probing=1`。
 
 ## 6. DNS、UDP 与本地 IP 防泄露
 
