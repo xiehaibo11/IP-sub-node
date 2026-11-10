@@ -130,8 +130,11 @@ try {
         echo "    server: '" . yaml_quote($hy2Address) . "'\n";
         echo "    port: " . (int)$hy2['port'] . "\n";
         echo "    password: '" . yaml_quote($hy2['password']) . "'\n";
-        if ($hy2['up_mbps'] > 0 && $hy2['down_mbps'] > 0) {
+        // Each rate on its own: a fixed upload rate wedges idle connections.
+        if ($hy2['up_mbps'] > 0) {
             echo "    up: '" . yaml_quote($hy2['up_mbps'] . ' Mbps') . "'\n";
+        }
+        if ($hy2['down_mbps'] > 0) {
             echo "    down: '" . yaml_quote($hy2['down_mbps'] . ' Mbps') . "'\n";
         }
         echo "    obfs: salamander\n";

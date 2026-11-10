@@ -76,8 +76,8 @@ function subscription_nodes(array $client): array {
             'sni' => node_env('HYSTERIA2_SNI', $sni),
             'password' => $password,
             'obfs_password' => $obfsPassword,
-            // Whole Mbps; a fixed rate is declared only when both are > 0,
-            // otherwise the client uses adaptive BBR.
+            // Whole Mbps; each rate is declared only when > 0 (else adaptive
+            // BBR for that direction). Keep up at 0, see clash.php.
             'up_mbps' => (int)node_env('HYSTERIA2_UP_MBPS', '0'),
             'down_mbps' => (int)node_env('HYSTERIA2_DOWN_MBPS', '0'),
         ];

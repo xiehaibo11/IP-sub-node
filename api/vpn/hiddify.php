@@ -82,8 +82,11 @@ try {
                 'alpn' => ['h3']
             ]
         ];
-        if ($hy2['up_mbps'] > 0 && $hy2['down_mbps'] > 0) {
+        // Each rate on its own: a fixed upload rate wedges idle connections.
+        if ($hy2['up_mbps'] > 0) {
             $hy2Outbound['up_mbps'] = $hy2['up_mbps'];
+        }
+        if ($hy2['down_mbps'] > 0) {
             $hy2Outbound['down_mbps'] = $hy2['down_mbps'];
         }
         $outbounds[] = $hy2Outbound;
